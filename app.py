@@ -12,6 +12,13 @@ from google.genai import types
 from openai import OpenAI
 from PIL import Image
 
+from serpapi_images import (
+    DEFAULT_TARGET_ASPECT,
+    REFERENCE_IMAGE_POOL_SIZE,
+    download_image_bytes,
+    fetch_serpapi_image_candidates,
+)
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -28,6 +35,8 @@ GALLERY_WIDTH = 1176
 GALLERY_HEIGHT = 516
 GALLERY_MAX_SIZE_KB = 50
 GALLERY_COUNT = 6
+# SerpApi pool → OpenAI picks best gallery-style references
+REFERENCE_TOP_K_OPENAI = 6
 GALLERY_SCENES = [
     "motivational speaker delivering a keynote on stage with a clean conference backdrop",
     "speaker interacting with an engaged audience during a live session",
@@ -78,6 +87,157 @@ def mime_from_name(filename: str) -> str:
 def slugify_artist_name(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip()).strip("_").lower()
     return cleaned or "artist_name"
+
+
+def _prepare_thumb_for_vision(image_bytes: bytes, max_edge: int = 384) -> tuple[bytes, str]:
+    """Downscale for OpenAI vision to reduce payload size."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    scale = min(max_edge / max(w, 1), max_edge / max(h, 1), 1.0)
+    if scale < 1.0:
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82, optimize=True)
+    return buf.getvalue(), "image/jpeg"
+
+
+def _prepare_thumb_for_ranking(image_bytes: bytes, max_edge: int = 768) -> tuple[bytes, str]:
+    """Larger thumbs for gallery-type scoring (event vs studio, face clarity)."""
+    return _prepare_thumb_for_vision(image_bytes, max_edge=max_edge)
+
+
+def _fallback_top_indices_by_aspect(rows: list[dict], target_aspect: float, k: int) -> list[int]:
+    scored: list[tuple[float, int]] = []
+    for i, r in enumerate(rows):
+        if not r.get("bytes"):
+            continue
+        ar = r.get("aspect_ratio")
+        if ar is None:
+            scored.append((999.0, i))
+        else:
+            scored.append((abs(ar - target_aspect), i))
+    scored.sort(key=lambda x: x[0])
+    return [i for _, i in scored[:k]]
+
+
+def rank_reference_images_openai(
+    rows: list[dict],
+    celebrity_name: str,
+    target_aspect: float,
+    top_k: int = REFERENCE_TOP_K_OPENAI,
+) -> tuple[list[int], str | None]:
+    """
+    Ask GPT-4o (vision) to pick best `top_k` indices into `rows` (0-based).
+    Returns (selected_indices, error_or_none).
+    """
+    with_bytes = [(i, r) for i, r in enumerate(rows) if r.get("bytes")]
+    if not with_bytes:
+        return [], "No images downloaded to rank."
+    top_k = min(top_k, len(with_bytes))
+
+    client = get_openai_client()
+    target_ratio_str = f"{target_aspect:.3f} (width ÷ height, e.g. banner ~{GALLERY_WIDTH}×{GALLERY_HEIGHT})"
+
+    image_content: list[dict] = []
+    for i, r in with_bytes:
+        image_content.append({"type": "text", "text": f"--- Image index {i} (shown below) ---"})
+        tb, mime = _prepare_thumb_for_ranking(r["bytes"])
+        image_content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": encode_image_for_openai(tb, mime), "detail": "high"},
+            }
+        )
+
+    valid_idx_str = ", ".join(str(i) for i, _ in with_bytes)
+
+    prompt = f"""You are selecting **live event / action gallery** reference photos for **{celebrity_name}** (artist on a booking-style site).
+
+You see {len(with_bytes)} images in order. Each block is labeled **Image index N**. Valid indices only: {valid_idx_str}.
+
+## Four target types (a strong pick should clearly match **at least one**)
+**TYPE 1 — Speaking / performing on stage**  
+Mic, podium, stage or event lighting, clearly presenting or performing (not a plain studio backdrop).
+
+**TYPE 2 — Audience interaction**  
+Visible crowd / audience, handshake, pointing to people, selfie-with-crowd energy, walkabout — clear **event + people** context.
+
+**TYPE 3 — Candid natural moment**  
+Feels like a real unposed slice of an event — natural smile, talking, walking, backstage vibe. **Deprioritize** static glamour **studio** portraits (flat backdrop, catalog beauty pose, no event context).
+
+**TYPE 4 — Expressive action moment**  
+Strong emotion or gesture: mid-speech, laugh, raised hand, performing energy — **not** stiff posed headshot.
+
+## Hard checks (must pass for a top pick unless no better option exists)
+- **Identity**: Main subject should plausibly be **{celebrity_name}** (reject obvious wrong person).
+- **One clear subject**: Exactly **one** dominant person (or one clear performer); not group collages or multi-panel images.
+- **Face**: Face **clearly visible** and sharp enough (not tiny silhouette, not heavy occlusion).
+- **Clarity**: Not extremely blurry, dark, or low-res.
+- **Text**: Reject heavy overlaid text, meme text, news banners, big watermarks; tiny corner logos OK.
+
+## Banner shape (secondary)
+Prefer width ÷ height near **{target_ratio_str}** for a wide gallery strip; avoid extreme vertical crops if you have alternatives.
+
+## Your task
+Pick exactly **{top_k}** distinct indices that **best** match the **event/action** brief (Types 1–4) while passing the hard checks. Prefer TYPE 1–4 over plain studio portraits.
+
+Respond ONLY with valid JSON (no markdown fences):
+{{
+  "selected_indices": [<exactly {top_k} integers from valid indices>],
+  "note": "<optional one short sentence>"
+}}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a strict event-photography editor. Output only valid JSON as requested.",
+            },
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=600,
+        temperature=0,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    try:
+        data = parse_json_response(raw)
+    except json.JSONDecodeError as e:
+        fb = _fallback_top_indices_by_aspect(rows, target_aspect, top_k)
+        return fb, f"OpenAI JSON parse failed ({e}); used aspect fallback."
+
+    chosen = data.get("selected_indices") or data.get("chosen") or []
+    if not isinstance(chosen, list):
+        fb = _fallback_top_indices_by_aspect(rows, target_aspect, top_k)
+        return fb, "OpenAI returned invalid format; used aspect fallback."
+
+    out: list[int] = []
+    seen: set[int] = set()
+    valid_set = {i for i, _ in with_bytes}
+    for x in chosen:
+        try:
+            xi = int(x)
+        except (TypeError, ValueError):
+            continue
+        if xi not in valid_set or xi in seen:
+            continue
+        seen.add(xi)
+        out.append(xi)
+        if len(out) >= top_k:
+            break
+
+    if len(out) < top_k:
+        for i in _fallback_top_indices_by_aspect(rows, target_aspect, top_k * 2):
+            if i not in seen and i in valid_set:
+                seen.add(i)
+                out.append(i)
+            if len(out) >= top_k:
+                break
+
+    return out[:top_k], None
 
 
 def resize_and_crop_to_fill(img: Image.Image, target_width: int, target_height: int) -> Image.Image:
@@ -379,6 +539,48 @@ Apply these preferences when they do not conflict with core quality and realism.
     raise RuntimeError("Gemini did not return a gallery image in its response.")
 
 
+def regenerate_reference_clean_gemini(source_image_bytes: bytes) -> bytes:
+    """
+    Gemini image model: faithful cleanup of one reference photo — remove text/watermarks,
+    keep people and scene unchanged. Caller applies exact WebP export (1176×516, size cap).
+    """
+    client = get_gemini_client()
+    pil_img = Image.open(io.BytesIO(source_image_bytes)).convert("RGB")
+    contents: list = [
+        pil_img,
+        """You are given ONE photograph below.
+
+Produce a cleaned version of THE SAME photograph for a wide website gallery banner.
+
+STRICT RULES (highest priority):
+1. **Identity lock**: Keep every person identical — same face, age, skin tone, hair, expression, pose, and body proportions. Do NOT beautify, de-age, slim, or change facial features.
+2. **Scene lock**: Keep clothing, environment, lighting direction, and overall colour faithful. This is restoration, not a re-shoot or art-style change.
+3. **Text removal only**: Remove overlaid text, captions, subtitles, news banners, channel logos, stock watermarks, meme text, and UI typography. Inpaint those regions so textures match surroundings naturally.
+4. **No text output**: The final image must contain **no readable letters, numbers, words, or logos** anywhere (including corners). Do NOT add watermarks or branding.
+5. **No new elements**: Do not add objects, people, or text. Do not crop off heads or key parts of the subject.
+6. **Format intent**: Single wide horizontal photorealistic image at high resolution (will be resized to ~1176×516 later — keep content suitable for a wide banner).
+
+If the source has no text, return a near-identical, slightly sharpened horizontal version only.""",
+    ]
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+    )
+
+    if not response.candidates:
+        raise RuntimeError("Gemini returned no candidates (blocked or empty response).")
+
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+
+    raise RuntimeError("Gemini did not return a cleaned image.")
+
+
 # ---------------------------------------------------------------------------
 # GUARDRAIL 2 – Output quality check
 # ---------------------------------------------------------------------------
@@ -450,6 +652,233 @@ optional_tags = st.text_area(
 
 if "result_data" not in st.session_state:
     st.session_state.result_data = None
+if "reference_pool_rows" not in st.session_state:
+    st.session_state.reference_pool_rows = None
+if "reference_top6_indices" not in st.session_state:
+    st.session_state.reference_top6_indices = None
+if "reference_rank_note" not in st.session_state:
+    st.session_state.reference_rank_note = None
+if "reference_regenerated" not in st.session_state:
+    st.session_state.reference_regenerated = None
+
+# ---- SerpApi Google Images: reference pool (gallery aspect) ----
+st.divider()
+st.subheader(f"Reference image pool (~{REFERENCE_IMAGE_POOL_SIZE} via SerpApi)")
+st.caption(
+    f"SerpApi searches favour **live event / action** shots (stage, audience, candid, expressive). "
+    f"Then **GPT-4o** picks **{REFERENCE_TOP_K_OPENAI}** using **four event types**, single clear subject, visible face, low text, "
+    f"plus banner aspect ~{GALLERY_WIDTH}×{GALLERY_HEIGHT}. "
+    "Set `SERPAPI_API_KEY` and `OPENAI_API_KEY` in `.env`."
+)
+if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_serpapi_pool", use_container_width=False):
+    st.session_state.reference_pool_rows = None
+    st.session_state.reference_top6_indices = None
+    st.session_state.reference_rank_note = None
+    st.session_state.reference_regenerated = None
+    if not artist_name.strip():
+        st.error("Enter an artist / celebrity name above first.")
+    else:
+        api_key = os.getenv("SERPAPI_API_KEY", "").strip()
+        if not api_key:
+            st.error("Missing `SERPAPI_API_KEY` in environment (.env).")
+        else:
+            with st.spinner(
+                f"SerpApi: fetching up to {REFERENCE_IMAGE_POOL_SIZE} images, "
+                f"then OpenAI: selecting top {REFERENCE_TOP_K_OPENAI}…"
+            ):
+                try:
+                    candidates = fetch_serpapi_image_candidates(
+                        artist_name.strip(),
+                        api_key,
+                        target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
+                        target_count=REFERENCE_IMAGE_POOL_SIZE,
+                    )
+                except Exception as e:
+                    st.error(str(e))
+                    candidates = []
+
+                rows: list[dict] = []
+                for pool_idx, c in enumerate(candidates):
+                    data = None
+                    err = None
+                    for url in (c.get("link"), c.get("thumbnail_link")):
+                        if not url:
+                            continue
+                        try:
+                            data = download_image_bytes(url)
+                            if data and len(data) > 500:
+                                break
+                        except Exception as ex:
+                            err = str(ex)
+                            data = None
+                    rows.append(
+                        {
+                            "pool_idx": pool_idx,
+                            "index": pool_idx + 1,
+                            "title": c.get("title", ""),
+                            "link": c.get("link", ""),
+                            "width": c.get("width"),
+                            "height": c.get("height"),
+                            "aspect_ratio": c.get("aspect_ratio"),
+                            "bytes": data,
+                            "error": err if not data else None,
+                        }
+                    )
+                st.session_state.reference_pool_rows = rows
+
+                ta = GALLERY_WIDTH / GALLERY_HEIGHT
+                try:
+                    top6, rank_err = rank_reference_images_openai(
+                        rows,
+                        artist_name.strip(),
+                        ta,
+                        top_k=REFERENCE_TOP_K_OPENAI,
+                    )
+                except Exception as e:
+                    top6 = _fallback_top_indices_by_aspect(rows, ta, REFERENCE_TOP_K_OPENAI)
+                    rank_err = f"OpenAI ranking failed ({e}); used aspect-ratio fallback."
+                st.session_state.reference_top6_indices = top6
+                st.session_state.reference_rank_note = rank_err
+
+if st.session_state.reference_pool_rows:
+    st.success(
+        f"Pool: {len(st.session_state.reference_pool_rows)} images "
+        f"(target {REFERENCE_IMAGE_POOL_SIZE})."
+    )
+    gcols = st.columns(5)
+    for idx, row in enumerate(st.session_state.reference_pool_rows):
+        with gcols[idx % 5]:
+            cap_parts = [f"#{row.get('index', idx + 1)}"]
+            if row.get("width") and row.get("height"):
+                cap_parts.append(f"{row['width']}×{row['height']}")
+            if row.get("aspect_ratio"):
+                cap_parts.append(f"r={row['aspect_ratio']:.2f}")
+            caption = " · ".join(cap_parts)
+            if row.get("bytes"):
+                st.image(row["bytes"], caption=caption, use_container_width=True)
+            else:
+                st.warning(f"{caption}\nCould not load: {row.get('error', 'unknown')}")
+            if row.get("link"):
+                st.markdown(f"[Open source]({row['link']})")
+
+    top6 = st.session_state.reference_top6_indices
+    if top6:
+        st.divider()
+        st.subheader(f"Top {REFERENCE_TOP_K_OPENAI} (OpenAI ranked)")
+        if st.session_state.reference_rank_note:
+            st.caption(st.session_state.reference_rank_note)
+        pool = st.session_state.reference_pool_rows
+        cols6 = st.columns(3)
+        for j, pool_idx in enumerate(top6):
+            if pool_idx < 0 or pool_idx >= len(pool):
+                continue
+            row = pool[pool_idx]
+            with cols6[j % 3]:
+                cap = f"Pick #{j + 1} · pool idx {pool_idx}"
+                if row.get("bytes"):
+                    st.image(row["bytes"], caption=cap, use_container_width=True)
+                else:
+                    st.warning(f"{cap} — missing bytes")
+                if row.get("link"):
+                    st.markdown(f"[Open source]({row['link']})")
+
+        st.caption(
+            f"Gemini re-renders each pick: removes text/watermarks, keeps people unchanged, "
+            f"then exports **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** `.webp` (target **≤{GALLERY_MAX_SIZE_KB} KB** each)."
+        )
+        if st.button(
+            f"Regenerate top {REFERENCE_TOP_K_OPENAI} with Gemini (clean + WebP)",
+            key="btn_regen_top6_gemini",
+            use_container_width=False,
+        ):
+            st.session_state.reference_regenerated = None
+            pool = st.session_state.reference_pool_rows
+            regen_out: list[dict] = []
+            with st.spinner(f"Gemini + WebP: processing {len(top6)} images…"):
+                for j, pool_idx in enumerate(top6):
+                    if pool_idx < 0 or pool_idx >= len(pool):
+                        regen_out.append(
+                            {
+                                "slot": j + 1,
+                                "pool_idx": pool_idx,
+                                "webp_bytes": None,
+                                "within_limit": False,
+                                "error": "Invalid pool index",
+                            }
+                        )
+                        continue
+                    src = pool[pool_idx].get("bytes")
+                    if not src:
+                        regen_out.append(
+                            {
+                                "slot": j + 1,
+                                "pool_idx": pool_idx,
+                                "webp_bytes": None,
+                                "within_limit": False,
+                                "error": "No source bytes",
+                            }
+                        )
+                        continue
+                    try:
+                        raw = regenerate_reference_clean_gemini(src)
+                        webp_b, ok = prepare_gallery_webp(raw)
+                        if not webp_b:
+                            raise RuntimeError("WebP export failed")
+                        regen_out.append(
+                            {
+                                "slot": j + 1,
+                                "pool_idx": pool_idx,
+                                "webp_bytes": webp_b,
+                                "within_limit": ok,
+                                "error": None,
+                            }
+                        )
+                    except Exception as ex:
+                        regen_out.append(
+                            {
+                                "slot": j + 1,
+                                "pool_idx": pool_idx,
+                                "webp_bytes": None,
+                                "within_limit": False,
+                                "error": str(ex),
+                            }
+                        )
+            st.session_state.reference_regenerated = regen_out
+
+    regen = st.session_state.reference_regenerated
+    if regen:
+        st.divider()
+        st.subheader("Gemini-cleaned gallery exports")
+        st.caption(
+            f"Each image: **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** WebP. "
+            f"Green caption = within {GALLERY_MAX_SIZE_KB} KB; otherwise best-effort compression."
+        )
+        rcols = st.columns(3)
+        for j, item in enumerate(regen):
+            with rcols[j % 3]:
+                slot = item.get("slot", j + 1)
+                if item.get("webp_bytes"):
+                    kb = len(item["webp_bytes"]) / 1024
+                    cap = f"Regen #{slot} · {kb:.1f} KB"
+                    if item.get("within_limit"):
+                        st.success(f"{cap} (≤{GALLERY_MAX_SIZE_KB} KB)")
+                    else:
+                        st.warning(f"{cap} (over {GALLERY_MAX_SIZE_KB} KB target)")
+                    st.image(
+                        Image.open(io.BytesIO(item["webp_bytes"])),
+                        caption=f"pool idx {item.get('pool_idx')}",
+                        use_container_width=True,
+                    )
+                    st.download_button(
+                        label=f"Download regen_{slot}.webp",
+                        data=item["webp_bytes"],
+                        file_name=f"gallery_regen_{slot}.webp",
+                        mime="image/webp",
+                        key=f"dl_regen_{slot}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.error(f"Regen #{slot} failed: {item.get('error', 'unknown')}")
 
 # ---- Sidebar ----
 with st.sidebar:
