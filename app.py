@@ -27,7 +27,8 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 GEMINI_MODEL = "gemini-2.5-flash-image"  # Nano Banana
-MAX_IMAGES = 5
+MIN_IMAGES = 2
+MAX_IMAGES = 3
 MAX_RETRY = 3
 STYLE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "1768222411704.jpg")
 PROFILE_WIDTH = 765
@@ -36,17 +37,9 @@ PROFILE_MAX_SIZE_KB = 50
 GALLERY_WIDTH = 1176
 GALLERY_HEIGHT = 516
 GALLERY_MAX_SIZE_KB = 50
-GALLERY_COUNT = 6
 # SerpApi pool → OpenAI picks best gallery-style references
 REFERENCE_TOP_K_OPENAI = 10
-GALLERY_SCENES = [
-    "motivational speaker delivering a keynote on stage with a clean conference backdrop",
-    "speaker interacting with an engaged audience during a live session",
-    "candid on-stage moment with expressive hand gestures and confident presence",
-    "corporate event speaking moment with natural lighting and professional ambience",
-    "comedy performance moment with expressive face and audience energy",
-    "off-stage candid portrait in an event environment with natural professional look",
-]
+NANO_BANANA_REGEN_MODEL = "gemini-2.5-flash-image"
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +457,72 @@ def prepare_gallery_webp(image_bytes: bytes) -> tuple[bytes, bool]:
         horizontal_focus=0.5,
         vertical_focus=0.25,
     )
+
+
+def regenerate_gallery_image_nano_banana(
+    source_image_bytes: bytes,
+    *,
+    model: str = NANO_BANANA_REGEN_MODEL,
+) -> bytes:
+    """
+    Regenerate a gallery candidate with Nano Banana while preserving identity/scene:
+    - remove visible text/watermarks/logos
+    - keep person and scene otherwise unchanged
+    - return PNG bytes resized/cropped to exact 1176x516
+    """
+    client = get_gemini_client()
+
+    src_img = Image.open(io.BytesIO(source_image_bytes)).convert("RGB")
+    src_w, src_h = src_img.size
+    src_ratio = src_w / max(src_h, 1)
+    target_ratio = GALLERY_WIDTH / GALLERY_HEIGHT
+    horizontal_focus = 0.5
+    vertical_focus = 0.5
+    if src_ratio < target_ratio:
+        # Wider crop from portrait-ish inputs: bias higher to protect head/face framing.
+        vertical_focus = 0.25
+
+    prompt = """Edit the provided image with minimal changes.
+
+STRICT REQUIREMENTS:
+1. Keep the exact same person and identity (face, body, pose, clothing, skin tone, hairstyle).
+2. Keep the same scene, camera angle, lighting, colors, and composition.
+3. Remove ALL visible text, logo, caption, subtitle, lower-third, and watermark from every area of the image.
+4. Text/watermark removal is mandatory. Replace removed regions naturally so no text fragments, ghosting, or logo artifacts remain.
+5. Do not add/remove people or objects unless needed for text/watermark cleanup.
+6. Do not stylize. Keep the result photorealistic and as close as possible to the source.
+
+Return one high-quality horizontal image."""
+
+    response = client.models.generate_content(
+        model=model,
+        contents=[src_img, prompt],
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+            image_config=types.ImageConfig(aspect_ratio="21:9"),
+        ),
+    )
+
+    edited_bytes: bytes | None = None
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            edited_bytes = part.inline_data.data
+            break
+
+    if not edited_bytes:
+        raise RuntimeError("Nano Banana did not return an image payload.")
+
+    edited_img = Image.open(io.BytesIO(edited_bytes)).convert("RGB")
+    final_img = resize_and_crop_to_fill(
+        edited_img,
+        GALLERY_WIDTH,
+        GALLERY_HEIGHT,
+        horizontal_focus=horizontal_focus,
+        vertical_focus=vertical_focus,
+    )
+    out = io.BytesIO()
+    final_img.save(out, format="PNG")
+    return out.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -888,548 +947,266 @@ If not, return is_approved=false and describe the specific mismatches (e.g. "nos
 # =====================================================================
 # STREAMLIT UI
 # =====================================================================
-st.set_page_config(page_title="LinkedIn Profile Generator", page_icon="📸", layout="wide")
+st.set_page_config(page_title="Engage4more Profile and Gallery Image Generator", page_icon="📸", layout="wide")
 
-st.title("LinkedIn Profile Image Generator")
-st.caption("Upload photos of a person → AI generates a professional LinkedIn headshot with a matching gradient background.")
+st.title("Engage4more Profile and Gallery Image Generator")
+st.caption(
+    "Enter artist name, optional profile tags, and upload 2-3 reference photos. "
+    "One click generates profile + final top 10 gallery images."
+)
 
 artist_name = st.text_input("Artist name", placeholder="e.g., Ankur Warikoo")
 optional_tags = st.text_area(
     "Optional tags/prompts",
     placeholder='e.g., "corporate keynote", "motivational speaker on stage", "stand-up comedy show"',
-    help="These tags guide profile and gallery generation style.",
+    help="These tags guide only the main profile image generation style.",
 )
 
 if "result_data" not in st.session_state:
     st.session_state.result_data = None
-if "reference_pool_rows" not in st.session_state:
-    st.session_state.reference_pool_rows = None
-if "reference_top_indices" not in st.session_state:
-    st.session_state.reference_top_indices = None
-# Migrate / drop old session key (before `reference_top_indices` rename)
-if "reference_top6_indices" in st.session_state:
-    if (
-        st.session_state.reference_top6_indices is not None
-        and st.session_state.reference_top_indices is None
-    ):
-        st.session_state.reference_top_indices = st.session_state.reference_top6_indices
-    del st.session_state["reference_top6_indices"]
-if "reference_rank_note" not in st.session_state:
-    st.session_state.reference_rank_note = None
-if "reference_regenerated" not in st.session_state:
-    st.session_state.reference_regenerated = None
-
-# ---- SerpApi Google Images: reference pool (gallery aspect) ----
-st.divider()
-st.subheader(f"Reference image pool (~{REFERENCE_IMAGE_POOL_SIZE} via SerpApi)")
-st.caption(
-    f"SerpApi searches favour **live event / action** shots (stage, audience, candid, expressive). "
-    f"Then **GPT-4o** picks **{REFERENCE_TOP_K_OPENAI}** using **four event types**, **exactly one person** per pick, visible face, low text, "
-    f"plus banner aspect ~{GALLERY_WIDTH}×{GALLERY_HEIGHT}. "
-    "Set `SERPAPI_API_KEY` and `OPENAI_API_KEY` in `.env`."
-)
-if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_serpapi_pool", use_container_width=False):
-    st.session_state.reference_pool_rows = None
-    st.session_state.reference_top_indices = None
-    st.session_state.reference_rank_note = None
-    st.session_state.reference_regenerated = None
-    if not artist_name.strip():
-        st.error("Enter an artist / celebrity name above first.")
-    else:
-        api_key = os.getenv("SERPAPI_API_KEY", "").strip()
-        if not api_key:
-            st.error("Missing `SERPAPI_API_KEY` in environment (.env).")
-        else:
-            with st.spinner(
-                f"SerpApi: fetching up to {REFERENCE_IMAGE_POOL_SIZE} images, "
-                f"then OpenAI: selecting top {REFERENCE_TOP_K_OPENAI}…"
-            ):
-                try:
-                    candidates = fetch_serpapi_image_candidates(
-                        artist_name.strip(),
-                        api_key,
-                        target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
-                        target_count=REFERENCE_IMAGE_POOL_SIZE,
-                    )
-                except Exception as e:
-                    st.error(str(e))
-                    candidates = []
-
-                rows: list[dict] = []
-                for pool_idx, c in enumerate(candidates):
-                    data = None
-                    err = None
-                    for url in (c.get("link"), c.get("thumbnail_link")):
-                        if not url:
-                            continue
-                        try:
-                            candidate = download_image_bytes(url)
-                            ok, decode_err = is_valid_image_bytes(candidate) if candidate else (False, "No data")
-                            if candidate and len(candidate) > 500 and ok:
-                                data = candidate
-                                break
-                            err = decode_err or "Downloaded bytes are not a valid image"
-                        except Exception as ex:
-                            err = str(ex)
-                            data = None
-                    rows.append(
-                        {
-                            "pool_idx": pool_idx,
-                            "index": pool_idx + 1,
-                            "title": c.get("title", ""),
-                            "link": c.get("link", ""),
-                            "width": c.get("width"),
-                            "height": c.get("height"),
-                            "aspect_ratio": c.get("aspect_ratio"),
-                            "bytes": data,
-                            "error": err if not data else None,
-                        }
-                    )
-                st.session_state.reference_pool_rows = rows
-
-                ta = GALLERY_WIDTH / GALLERY_HEIGHT
-                try:
-                    top_indices, rank_err = rank_reference_images_openai(
-                        rows,
-                        artist_name.strip(),
-                        ta,
-                        top_k=REFERENCE_TOP_K_OPENAI,
-                    )
-                except Exception as e:
-                    top_indices = _fallback_top_indices_by_aspect(rows, ta, REFERENCE_TOP_K_OPENAI)
-                    rank_err = f"OpenAI ranking failed ({e}); used aspect-ratio fallback."
-                st.session_state.reference_top_indices = top_indices
-                st.session_state.reference_rank_note = rank_err
-
-if st.session_state.reference_pool_rows:
-    st.success(
-        f"Pool: {len(st.session_state.reference_pool_rows)} images "
-        f"(target {REFERENCE_IMAGE_POOL_SIZE})."
-    )
-    gcols = st.columns(5)
-    for idx, row in enumerate(st.session_state.reference_pool_rows):
-        with gcols[idx % 5]:
-            cap_parts = [f"#{row.get('index', idx + 1)}"]
-            if row.get("width") and row.get("height"):
-                cap_parts.append(f"{row['width']}×{row['height']}")
-            if row.get("aspect_ratio"):
-                cap_parts.append(f"r={row['aspect_ratio']:.2f}")
-            caption = " · ".join(cap_parts)
-            if row.get("bytes"):
-                try:
-                    st.image(row["bytes"], caption=caption, use_container_width=True)
-                except Exception as ex:
-                    st.warning(f"{caption}\nPreview failed: {ex}")
-            else:
-                st.warning(f"{caption}\nCould not load: {row.get('error', 'unknown')}")
-            if row.get("link"):
-                st.markdown(f"[Open source]({row['link']})")
-
-    top_indices = st.session_state.reference_top_indices
-    if top_indices:
-        st.divider()
-        st.subheader(f"Top {REFERENCE_TOP_K_OPENAI} (OpenAI ranked)")
-        if st.session_state.reference_rank_note:
-            st.caption(st.session_state.reference_rank_note)
-        pool = st.session_state.reference_pool_rows
-        cols_top = st.columns(5)
-        for j, pool_idx in enumerate(top_indices):
-            if pool_idx < 0 or pool_idx >= len(pool):
-                continue
-            row = pool[pool_idx]
-            with cols_top[j % 5]:
-                cap = f"Pick #{j + 1} · pool idx {pool_idx}"
-                if row.get("bytes"):
-                    try:
-                        st.image(row["bytes"], caption=cap, use_container_width=True)
-                    except Exception as ex:
-                        st.warning(f"{cap} — preview failed: {ex}")
-                else:
-                    st.warning(f"{cap} — missing bytes")
-                if row.get("link"):
-                    st.markdown(f"[Open source]({row['link']})")
-
-        st.caption(
-            f"**Crop only (no generative model)**: OpenCV face detection centers the crop, then a hard **crop + resize** "
-            f"to **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** (same pixels as the source, only geometry). "
-            f"**WebP**: Pillow encodes under **≤{GALLERY_MAX_SIZE_KB} KB** when possible. "
-            "Text/watermarks are not removed here (that would require inpainting)."
-        )
-        if st.button(
-            f"Process top {REFERENCE_TOP_K_OPENAI} (face-centered crop + WebP)",
-            key="btn_top10_crop_webp",
-            use_container_width=False,
-        ):
-            st.session_state.reference_regenerated = None
-            pool = st.session_state.reference_pool_rows
-            regen_out: list[dict] = []
-            with st.spinner(f"Cropping + WebP: processing {len(top_indices)} images..."):
-                for j, pool_idx in enumerate(top_indices):
-                    if pool_idx < 0 or pool_idx >= len(pool):
-                        regen_out.append(
-                            {
-                                "slot": j + 1,
-                                "pool_idx": pool_idx,
-                                "webp_bytes": None,
-                                "within_limit": False,
-                                "error": "Invalid pool index",
-                            }
-                        )
-                        continue
-                    src = pool[pool_idx].get("bytes")
-                    if not src:
-                        regen_out.append(
-                            {
-                                "slot": j + 1,
-                                "pool_idx": pool_idx,
-                                "webp_bytes": None,
-                                "within_limit": False,
-                                "error": "No source bytes",
-                            }
-                        )
-                        continue
-                    try:
-                        rgb_banner = crop_gallery_banner_face_centered_code_only(src)
-                        webp_b, ok = prepare_gallery_webp_exact_rgb(rgb_banner)
-                        if not webp_b:
-                            raise RuntimeError("WebP export failed")
-                        regen_out.append(
-                            {
-                                "slot": j + 1,
-                                "pool_idx": pool_idx,
-                                "webp_bytes": webp_b,
-                                "within_limit": ok,
-                                "error": None,
-                            }
-                        )
-                    except Exception as ex:
-                        regen_out.append(
-                            {
-                                "slot": j + 1,
-                                "pool_idx": pool_idx,
-                                "webp_bytes": None,
-                                "within_limit": False,
-                                "error": str(ex),
-                            }
-                        )
-            st.session_state.reference_regenerated = regen_out
-
-    regen = st.session_state.reference_regenerated
-    if regen:
-        st.divider()
-        st.subheader("Gallery exports (face-centered crop + WebP)")
-        st.caption(
-            f"Each image: **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** WebP (crop + resize only). "
-            f"Green caption = within {GALLERY_MAX_SIZE_KB} KB; otherwise best-effort compression."
-        )
-        rcols = st.columns(5)
-        for j, item in enumerate(regen):
-            with rcols[j % 5]:
-                slot = item.get("slot", j + 1)
-                if item.get("webp_bytes"):
-                    kb = len(item["webp_bytes"]) / 1024
-                    cap = f"Regen #{slot} · {kb:.1f} KB"
-                    if item.get("within_limit"):
-                        st.success(f"{cap} (≤{GALLERY_MAX_SIZE_KB} KB)")
-                    else:
-                        st.warning(f"{cap} (over {GALLERY_MAX_SIZE_KB} KB target)")
-                    st.image(
-                        Image.open(io.BytesIO(item["webp_bytes"])),
-                        caption=f"pool idx {item.get('pool_idx')}",
-                        use_container_width=True,
-                    )
-                    st.download_button(
-                        label=f"Download regen_{slot}.webp",
-                        data=item["webp_bytes"],
-                        file_name=f"gallery_regen_{slot}.webp",
-                        mime="image/webp",
-                        key=f"dl_regen_{slot}",
-                        use_container_width=True,
-                    )
-                else:
-                    st.error(f"Regen #{slot} failed: {item.get('error', 'unknown')}")
 
 # ---- Sidebar ----
 with st.sidebar:
     st.header("How it works")
-    st.markdown("""
-1. **Upload** 1–5 clear photos showing face & shoulders
-2. **Input Guardrail** checks visibility & quality (OpenAI GPT-4o)
-3. **Nano Banana** (Gemini) generates a LinkedIn headshot
-4. **Output Guardrail** validates the result (up to 3 retries)
-5. **Download** your final image
-""")
+    st.markdown(
+        f"""
+1. Upload **{MIN_IMAGES}-{MAX_IMAGES}** clear reference photos
+2. Generate **profile image** (Nano Banana + output review)
+3. Fetch SerpApi pool, rank top **{REFERENCE_TOP_K_OPENAI}** with GPT-4o
+4. Regenerate those top **{REFERENCE_TOP_K_OPENAI}** with Nano Banana
+5. Download single ZIP (`profile.webp` + `gallery1.webp` ... `gallery10.webp`)
+"""
+    )
     st.divider()
     st.markdown("**Models used**")
-    st.markdown("- Input/Output guardrail: `gpt-4o`")
-    st.markdown(f"- Image generation: `{GEMINI_MODEL}`")
+    st.markdown("- Profile output review / ranking: `gpt-4o`")
+    st.markdown(f"- Profile + gallery regeneration: `{GEMINI_MODEL}`")
 
 # ---- File uploader ----
 uploaded_files = st.file_uploader(
-    "Upload person photos (JPEG / PNG / WebP)",
+    f"Upload {MIN_IMAGES}-{MAX_IMAGES} person photos (JPEG / PNG / WebP)",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
 
 if uploaded_files:
-    if len(uploaded_files) > MAX_IMAGES:
-        st.error(f"Maximum {MAX_IMAGES} images allowed. You uploaded {len(uploaded_files)}.")
+    if len(uploaded_files) < MIN_IMAGES or len(uploaded_files) > MAX_IMAGES:
+        st.error(f"Please upload between {MIN_IMAGES} and {MAX_IMAGES} images. You uploaded {len(uploaded_files)}.")
         st.stop()
 
-    # Show uploaded previews
     st.subheader("Uploaded Images")
-    cols = st.columns(min(len(uploaded_files), 5))
+    cols = st.columns(min(len(uploaded_files), MAX_IMAGES))
     for i, f in enumerate(uploaded_files):
         with cols[i % len(cols)]:
             st.image(f, caption=f.name, use_container_width=True)
 
-    # ---- Generate button ----
-    if st.button("Generate LinkedIn Profile Image", type="primary", use_container_width=True):
-        st.session_state.result_data = None
-        artist_folder = slugify_artist_name(artist_name)
-        custom_prompt = optional_tags.strip() or None
+if st.button("Generate Image", type="primary", use_container_width=True):
+    st.session_state.result_data = None
 
-        if not artist_name.strip():
-            st.error("Please enter an artist name to generate structured output.")
+    if not artist_name.strip():
+        st.error("Please enter an artist name.")
+        st.stop()
+    if not uploaded_files:
+        st.error(f"Please upload {MIN_IMAGES}-{MAX_IMAGES} reference images.")
+        st.stop()
+    if len(uploaded_files) < MIN_IMAGES or len(uploaded_files) > MAX_IMAGES:
+        st.error(f"Please upload between {MIN_IMAGES} and {MAX_IMAGES} images.")
+        st.stop()
+
+    api_key = os.getenv("SERPAPI_API_KEY", "").strip()
+    if not api_key:
+        st.error("Missing `SERPAPI_API_KEY` in `.env`.")
+        st.stop()
+
+    artist_folder = slugify_artist_name(artist_name)
+    custom_prompt = optional_tags.strip() or None
+
+    images: list[tuple[bytes, str]] = []
+    for f in uploaded_files:
+        f.seek(0)
+        images.append((f.read(), mime_from_name(f.name)))
+
+    # Step 1: input check
+    with st.status("Step 1/5 — Input quality check...", expanded=True) as status:
+        try:
+            input_check = input_guardrail(images)
+        except Exception as e:
+            st.error(f"Input guardrail failed: {e}")
+            st.stop()
+        if not input_check.get("is_approved"):
+            status.update(label="Step 1/5 — Input guardrail failed", state="error")
+            st.error("Some uploaded images failed quality checks.")
+            for issue in input_check.get("issues", []):
+                idx = issue.get("image_index", "?")
+                problems = issue.get("problems", [])
+                file_name = uploaded_files[idx].name if isinstance(idx, int) and idx < len(uploaded_files) else f"Image {idx}"
+                for p in problems:
+                    st.write(f"- **{file_name}**: {p}")
+            st.stop()
+        status.update(label="Step 1/5 — Input guardrail passed", state="complete")
+
+    # Step 2: profile generation (single attempt, no retry)
+    generated_image = None
+    output_check = None
+    with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
+        try:
+            generated_image = generate_linkedin_image(images, None, custom_prompt)
+        except Exception as e:
+            st.error(f"Profile generation failed: {e}")
+            st.stop()
+        try:
+            output_check = output_guardrail(generated_image, images)
+        except Exception as e:
+            st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
+            output_check = {"is_approved": True, "things_to_improve": False}
+        if output_check.get("is_approved"):
+            status.update(label="Step 2/5 — Profile approved", state="complete")
+        else:
+            st.error(f"Profile failed output guardrail: {output_check.get('things_to_improve', 'unknown reason')}")
+            st.stop()
+        if generated_image is None:
+            st.error("Profile generation failed.")
             st.stop()
 
-        # Read all files into (bytes, mime) tuples
-        images: list[tuple[bytes, str]] = []
-        for f in uploaded_files:
-            f.seek(0)
-            images.append((f.read(), mime_from_name(f.name)))
+    profile_webp_bytes, profile_within_limit = prepare_profile_webp(generated_image)
+    if not profile_webp_bytes:
+        st.error("Failed to prepare profile.webp.")
+        st.stop()
 
-        # ── STEP 1: Input guardrail ──────────────────────────────
-        with st.status("Step 1/3 — Checking image quality...", expanded=True) as status:
-            st.write("Analyzing face visibility, hair, shoulders, and image quality...")
+    # Step 3: fetch SerpApi pool
+    with st.status("Step 3/5 — Fetching gallery references from SerpApi...", expanded=False) as status:
+        try:
+            candidates = fetch_serpapi_image_candidates(
+                artist_name.strip(),
+                api_key,
+                target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
+                target_count=REFERENCE_IMAGE_POOL_SIZE,
+            )
+        except Exception as e:
+            st.error(f"SerpApi fetch failed: {e}")
+            st.stop()
+        rows: list[dict] = []
+        for pool_idx, c in enumerate(candidates):
+            data = None
+            err = None
+            for url in (c.get("link"), c.get("thumbnail_link")):
+                if not url:
+                    continue
+                try:
+                    candidate = download_image_bytes(url)
+                    ok, decode_err = is_valid_image_bytes(candidate) if candidate else (False, "No data")
+                    if candidate and len(candidate) > 500 and ok:
+                        data = candidate
+                        break
+                    err = decode_err or "Downloaded bytes are not a valid image"
+                except Exception as ex:
+                    err = str(ex)
+                    data = None
+            rows.append(
+                {
+                    "pool_idx": pool_idx,
+                    "index": pool_idx + 1,
+                    "title": c.get("title", ""),
+                    "link": c.get("link", ""),
+                    "width": c.get("width"),
+                    "height": c.get("height"),
+                    "aspect_ratio": c.get("aspect_ratio"),
+                    "bytes": data,
+                    "error": err if not data else None,
+                }
+            )
+        if not rows:
+            st.error("No gallery references found from SerpApi.")
+            st.stop()
+        status.update(label="Step 3/5 — SerpApi references fetched", state="complete")
+
+    # Step 4: rank top 10
+    with st.status("Step 4/5 — Ranking top 10 gallery references...", expanded=False) as status:
+        ta = GALLERY_WIDTH / GALLERY_HEIGHT
+        try:
+            top_indices, rank_err = rank_reference_images_openai(
+                rows,
+                artist_name.strip(),
+                ta,
+                top_k=REFERENCE_TOP_K_OPENAI,
+            )
+        except Exception as e:
+            st.error(f"Ranking failed: {e}")
+            st.stop()
+        if rank_err:
+            st.warning(rank_err)
+        if len(top_indices) < REFERENCE_TOP_K_OPENAI:
+            st.error(f"Ranking produced only {len(top_indices)} images; expected {REFERENCE_TOP_K_OPENAI}.")
+            st.stop()
+        status.update(label="Step 4/5 — Top 10 selected", state="complete")
+
+    # Step 5: regenerate top 10 (serial, no retry)
+    gallery_outputs: list[tuple[str, bytes, bool]] = []
+    with st.status("Step 5/5 — Regenerating final 10 gallery images...", expanded=True):
+        progress = st.progress(0, text=f"Processing 0/{REFERENCE_TOP_K_OPENAI}")
+        for j, pool_idx in enumerate(top_indices, start=1):
+            if pool_idx < 0 or pool_idx >= len(rows):
+                st.error(f"Gallery {j} failed: invalid ranked index.")
+                st.stop()
+            src = rows[pool_idx].get("bytes")
+            if not src:
+                st.error(f"Gallery {j} failed: missing source bytes.")
+                st.stop()
             try:
-                input_check = input_guardrail(images)
-            except Exception as e:
-                st.error(f"Input guardrail failed: {e}")
+                png_banner = regenerate_gallery_image_nano_banana(src)
+                webp_b, ok = prepare_gallery_webp(png_banner)
+            except Exception as ex:
+                st.error(f"Gallery {j} failed: {ex}")
                 st.stop()
-
-            if input_check.get("is_approved"):
-                st.write("All images passed quality checks.")
-                status.update(label="Step 1/3 — Input guardrail passed", state="complete")
-            else:
-                status.update(label="Step 1/3 — Input guardrail FAILED", state="error")
-                st.error("Some images did not pass the quality check:")
-                for issue in input_check.get("issues", []):
-                    idx = issue.get("image_index", "?")
-                    problems = issue.get("problems", [])
-                    file_name = uploaded_files[idx].name if isinstance(idx, int) and idx < len(uploaded_files) else f"Image {idx}"
-                    for p in problems:
-                        st.write(f"- **{file_name}**: {p}")
-                st.info("Please upload clearer photos where the person's face, hair, and shoulders are fully visible.")
+            if not webp_b:
+                st.error(f"Gallery {j} failed: WebP export failed.")
                 st.stop()
+            gallery_outputs.append((f"gallery{j}.webp", webp_b, ok))
+            progress.progress(int((j / REFERENCE_TOP_K_OPENAI) * 100), text=f"Processing {j}/{REFERENCE_TOP_K_OPENAI}")
 
-        # ── STEP 2 + 3: Generate + output guardrail (retry loop) ─
-        generated_image = None
-        output_check = None
-        improvement_feedback = None
-        attempt = 0
+    # Build zip output
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(f"{artist_folder}/profile.webp", profile_webp_bytes)
+        for name, data, _ in gallery_outputs:
+            zip_file.writestr(f"{artist_folder}/{name}", data)
 
-        with st.status("Step 2/3 — Generating LinkedIn headshot...", expanded=True) as status:
-            for attempt in range(1, MAX_RETRY + 1):
-                # Generation
-                st.write(f"**Attempt {attempt}/{MAX_RETRY}** — Generating image with Gemini Nano Banana...")
-                try:
-                    generated_image = generate_linkedin_image(images, improvement_feedback, custom_prompt)
-                except Exception as e:
-                    st.error(f"Image generation failed: {e}")
-                    st.stop()
+    st.session_state.result_data = {
+        "profile_webp_bytes": profile_webp_bytes,
+        "profile_within_limit": profile_within_limit,
+        "gallery_outputs": gallery_outputs,
+        "zip_bytes": zip_buffer.getvalue(),
+        "artist_folder": artist_folder,
+    }
 
-                st.write(f"**Attempt {attempt}/{MAX_RETRY}** — Validating output quality...")
-                try:
-                    output_check = output_guardrail(generated_image, images)
-                except Exception as e:
-                    # Don't crash — we already have a generated image; trust it.
-                    st.warning(f"Output guardrail errored ({e}) — treating image as approved.")
-                    output_check = {"is_approved": True, "things_to_improve": False}
+result_data = st.session_state.result_data
+if result_data:
+    st.divider()
+    st.subheader("Final Output")
 
-                if output_check.get("is_approved"):
-                    st.write("Output guardrail approved the image.")
-                    status.update(label=f"Steps 2–3 — Image approved (attempt {attempt})", state="complete")
-                    break
+    profile_webp_bytes = result_data["profile_webp_bytes"]
+    profile_within_limit = result_data["profile_within_limit"]
+    gallery_outputs = result_data["gallery_outputs"]
+    zip_bytes = result_data["zip_bytes"]
+    artist_folder = result_data["artist_folder"]
 
-                # Not approved — show feedback and retry
-                improvement_feedback = output_check.get("things_to_improve", "")
-                st.warning(f"Attempt {attempt} rejected: {improvement_feedback}")
+    if profile_within_limit:
+        st.success(f"`profile.webp` meets size target (<= {PROFILE_MAX_SIZE_KB} KB).")
+    else:
+        actual_kb = len(profile_webp_bytes) / 1024
+        st.warning(f"`profile.webp` is best-effort at {actual_kb:.1f} KB (target <= {PROFILE_MAX_SIZE_KB} KB).")
 
-                if attempt == MAX_RETRY:
-                    status.update(label=f"Steps 2–3 — Best effort after {MAX_RETRY} attempts", state="complete")
+    st.caption("Showing only final generated assets.")
+    preview_cols = st.columns(3)
+    all_outputs = [("profile.webp", profile_webp_bytes)] + [(name, data) for name, data, _ in gallery_outputs]
+    for idx, (name, data) in enumerate(all_outputs):
+        with preview_cols[idx % 3]:
+            st.image(Image.open(io.BytesIO(data)), caption=f"{name} ({len(data)/1024:.1f} KB)", use_container_width=True)
 
-        if generated_image:
-            profile_webp_bytes, within_limit = prepare_profile_webp(generated_image)
-            if not profile_webp_bytes:
-                st.error("Failed to prepare final profile image in WebP format.")
-                st.stop()
-
-            # ---- Gallery generation (6 variants) ----
-            st.divider()
-            st.subheader("Gallery Images")
-            st.caption(
-                f"Generating {GALLERY_COUNT} gallery variants ({GALLERY_WIDTH}x{GALLERY_HEIGHT}, .webp, target <= {GALLERY_MAX_SIZE_KB} KB each)."
-            )
-
-            gallery_outputs: list[tuple[str, bytes, bool]] = []
-            GALLERY_MAX_ATTEMPTS = 2  # 1 retry on face-match failure
-            with st.status("Generating gallery images...", expanded=True) as gallery_status:
-                for i, scene in enumerate(GALLERY_SCENES[:GALLERY_COUNT], start=1):
-                    st.write(f"**Gallery image {i}/{GALLERY_COUNT}** — scene: _{scene}_")
-
-                    raw_gallery = None
-                    face_feedback = None
-                    face_approved = False
-
-                    for g_attempt in range(1, GALLERY_MAX_ATTEMPTS + 1):
-                        st.write(f"Attempt {g_attempt}/{GALLERY_MAX_ATTEMPTS} — generating with face anchor...")
-                        try:
-                            raw_gallery = generate_gallery_image(
-                                images=images,
-                                scene_prompt=scene,
-                                profile_anchor_image=generated_image,
-                                improvement_feedback=face_feedback,
-                                custom_prompt=custom_prompt,
-                            )
-                        except Exception as e:
-                            st.warning(f"Gallery image {i} generation failed: {e}")
-                            raw_gallery = None
-                            break
-
-                        # Face-match guardrail
-                        st.write(f"Attempt {g_attempt}/{GALLERY_MAX_ATTEMPTS} — checking face match...")
-                        try:
-                            face_check = gallery_face_match_guardrail(raw_gallery, generated_image)
-                        except Exception as e:
-                            st.warning(f"Face-match guardrail failed for image {i}: {e} — keeping best effort.")
-                            face_check = {"is_approved": True, "things_to_improve": False}
-
-                        if face_check.get("is_approved"):
-                            st.write(f"Face match approved on attempt {g_attempt}.")
-                            face_approved = True
-                            break
-
-                        face_feedback = face_check.get("things_to_improve", "")
-                        st.warning(f"Attempt {g_attempt} face mismatch: {face_feedback}")
-
-                    if raw_gallery is None:
-                        continue
-
-                    if not face_approved:
-                        st.info(f"Gallery image {i}: kept best-effort result after {GALLERY_MAX_ATTEMPTS} attempts.")
-
-                    try:
-                        gallery_webp_bytes, gallery_within_limit = prepare_gallery_webp(raw_gallery)
-                    except Exception as e:
-                        st.warning(f"Gallery image {i} webp conversion failed: {e}")
-                        continue
-
-                    if not gallery_webp_bytes:
-                        st.warning(f"Gallery image {i} could not be prepared in WebP.")
-                        continue
-
-                    gallery_outputs.append((f"gallery{i}.webp", gallery_webp_bytes, gallery_within_limit))
-
-                if len(gallery_outputs) == GALLERY_COUNT:
-                    gallery_status.update(label="Gallery generation complete", state="complete")
-                elif gallery_outputs:
-                    gallery_status.update(label="Gallery generation partially complete", state="complete")
-                else:
-                    gallery_status.update(label="Gallery generation failed", state="error")
-
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-                zip_file.writestr(f"{artist_folder}/profile.webp", profile_webp_bytes)
-                for name, data, _ in gallery_outputs:
-                    zip_file.writestr(f"{artist_folder}/{name}", data)
-
-            st.session_state.result_data = {
-                "output_check": output_check,
-                "attempt": attempt,
-                "profile_webp_bytes": profile_webp_bytes,
-                "profile_within_limit": within_limit,
-                "gallery_outputs": gallery_outputs,
-                "zip_bytes": zip_buffer.getvalue(),
-                "artist_folder": artist_folder,
-            }
-
-    result_data = st.session_state.result_data
-    if result_data:
-        st.divider()
-        st.subheader("Result")
-
-        output_check = result_data["output_check"]
-        attempt = result_data["attempt"]
-        profile_webp_bytes = result_data["profile_webp_bytes"]
-        profile_within_limit = result_data["profile_within_limit"]
-        gallery_outputs = result_data["gallery_outputs"]
-        zip_bytes = result_data["zip_bytes"]
-        artist_folder = result_data["artist_folder"]
-
-        if output_check and output_check.get("is_approved"):
-            st.success(f"Image approved on attempt {attempt}.")
-        else:
-            st.warning(
-                f"Image was not fully approved after {MAX_RETRY} attempts. "
-                "Showing the best result. You can try again with different photos."
-            )
-            if output_check and output_check.get("things_to_improve"):
-                with st.expander("Remaining issues"):
-                    st.write(output_check["things_to_improve"])
-
-        if profile_within_limit:
-            st.success(f"Profile output meets size target (<= {PROFILE_MAX_SIZE_KB} KB).")
-        else:
-            actual_kb = len(profile_webp_bytes) / 1024
-            st.warning(
-                f"Could not reach <= {PROFILE_MAX_SIZE_KB} KB without heavy quality loss. "
-                f"Using best effort: {actual_kb:.1f} KB."
-            )
-
-        result_img = Image.open(io.BytesIO(profile_webp_bytes))
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.image(result_img, caption="Generated LinkedIn Profile Image", use_container_width=True)
-
-        st.download_button(
-            label="Download Image",
-            data=profile_webp_bytes,
-            file_name="profile.webp",
-            mime="image/webp",
-            use_container_width=True,
-        )
-
-        st.divider()
-        st.subheader("Gallery Images")
-        if gallery_outputs:
-            preview_cols = st.columns(3)
-            for idx, (name, data, gallery_within_limit) in enumerate(gallery_outputs):
-                with preview_cols[idx % 3]:
-                    st.image(
-                        Image.open(io.BytesIO(data)),
-                        caption=f"{name} ({len(data)/1024:.1f} KB)",
-                        use_container_width=True,
-                    )
-                    if gallery_within_limit:
-                        st.caption("Meets <= 50 KB")
-                    else:
-                        st.caption("Best effort (over 50 KB)")
-                    st.download_button(
-                        label=f"Download {name}",
-                        data=data,
-                        file_name=name,
-                        mime="image/webp",
-                        key=f"download_{name}",
-                        use_container_width=True,
-                    )
-        else:
-            st.warning("No gallery images were successfully generated.")
-
-        st.download_button(
-            label="Download All Images (ZIP)",
-            data=zip_bytes,
-            file_name=f"{artist_folder}_images.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+    st.download_button(
+        label="Download All Images (ZIP)",
+        data=zip_bytes,
+        file_name=f"{artist_folder}_images.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
