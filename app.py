@@ -12,11 +12,11 @@ from google.genai import types
 from openai import OpenAI
 from PIL import Image
 
-from serpapi_images import (
+from google_images import (
     DEFAULT_TARGET_ASPECT,
     REFERENCE_IMAGE_POOL_SIZE,
     download_image_bytes,
-    fetch_serpapi_image_candidates,
+    fetch_google_image_candidates,
 )
 
 load_dotenv()
@@ -35,7 +35,7 @@ GALLERY_WIDTH = 1176
 GALLERY_HEIGHT = 516
 GALLERY_MAX_SIZE_KB = 50
 GALLERY_COUNT = 6
-# SerpApi pool → OpenAI picks best gallery-style references
+# Google image pool → OpenAI picks best gallery-style references
 REFERENCE_TOP_K_OPENAI = 6
 GALLERY_SCENES = [
     "motivational speaker delivering a keynote on stage with a clean conference backdrop",
@@ -833,16 +833,16 @@ if "reference_rank_note" not in st.session_state:
 if "reference_regenerated" not in st.session_state:
     st.session_state.reference_regenerated = None
 
-# ---- SerpApi Google Images: reference pool (gallery aspect) ----
+# ---- Google Images API: reference pool (gallery aspect) ----
 st.divider()
-st.subheader(f"Reference image pool (~{REFERENCE_IMAGE_POOL_SIZE} via SerpApi)")
+st.subheader(f"Reference image pool (~{REFERENCE_IMAGE_POOL_SIZE} via Google API)")
 st.caption(
-    f"SerpApi searches favour **live event / action** shots (stage, audience, candid, expressive). "
+    f"Google API searches favour **live event / action** shots (stage, audience, candid, expressive). "
     f"Then **GPT-4o** picks **{REFERENCE_TOP_K_OPENAI}** using **four event types**, single clear subject, visible face, low text, "
     f"plus banner aspect ~{GALLERY_WIDTH}×{GALLERY_HEIGHT}. "
-    "Set `SERPAPI_API_KEY` and `OPENAI_API_KEY` in `.env`."
+    "Set `GOOGLE_CSE_API_KEY`, `GOOGLE_CSE_ID`, and `OPENAI_API_KEY` in `.env`."
 )
-if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_serpapi_pool", use_container_width=False):
+if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (Google API)", key="btn_google_pool", use_container_width=False):
     st.session_state.reference_pool_rows = None
     st.session_state.reference_top6_indices = None
     st.session_state.reference_rank_note = None
@@ -850,18 +850,20 @@ if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_ser
     if not artist_name.strip():
         st.error("Enter an artist / celebrity name above first.")
     else:
-        api_key = os.getenv("SERPAPI_API_KEY", "").strip()
-        if not api_key:
-            st.error("Missing `SERPAPI_API_KEY` in environment (.env).")
+        api_key = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
+        cx = os.getenv("GOOGLE_CSE_ID", "").strip()
+        if not api_key or not cx:
+            st.error("Missing `GOOGLE_CSE_API_KEY` or `GOOGLE_CSE_ID` in environment (.env).")
         else:
             with st.spinner(
-                f"SerpApi: fetching up to {REFERENCE_IMAGE_POOL_SIZE} images, "
+                f"Google API: fetching up to {REFERENCE_IMAGE_POOL_SIZE} images, "
                 f"then OpenAI: selecting top {REFERENCE_TOP_K_OPENAI}…"
             ):
                 try:
-                    candidates = fetch_serpapi_image_candidates(
+                    candidates = fetch_google_image_candidates(
                         artist_name.strip(),
                         api_key,
+                        cx,
                         target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
                         target_count=REFERENCE_IMAGE_POOL_SIZE,
                     )
