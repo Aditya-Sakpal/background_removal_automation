@@ -5,6 +5,8 @@ import os
 import re
 import zipfile
 
+import cv2
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
@@ -36,7 +38,7 @@ GALLERY_HEIGHT = 516
 GALLERY_MAX_SIZE_KB = 50
 GALLERY_COUNT = 6
 # SerpApi pool → OpenAI picks best gallery-style references
-REFERENCE_TOP_K_OPENAI = 6
+REFERENCE_TOP_K_OPENAI = 10
 GALLERY_SCENES = [
     "motivational speaker delivering a keynote on stage with a clean conference backdrop",
     "speaker interacting with an engaged audience during a live session",
@@ -113,6 +115,94 @@ def mime_from_name(filename: str) -> str:
 def slugify_artist_name(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip()).strip("_").lower()
     return cleaned or "artist_name"
+
+
+def is_valid_image_bytes(image_bytes: bytes) -> tuple[bool, str | None]:
+    """Return whether bytes decode as an actual image."""
+    if not image_bytes:
+        return False, "Empty payload"
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im.load()
+        return True, None
+    except Exception as e:
+        return False, f"Invalid image bytes ({e})"
+
+
+def _face_center_from_image_rgb(img: Image.Image) -> tuple[float, float] | None:
+    """Return (cx, cy) in pixel coords of largest frontal face, or None."""
+    rgb = np.asarray(img.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    cascade = cv2.CascadeClassifier(cascade_path)
+    if cascade.empty():
+        return None
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    if faces is None or len(faces) == 0:
+        return None
+    areas = [int(fw) * int(fh) for (_x, _y, fw, fh) in faces]
+    i = int(np.argmax(areas))
+    x, y, fw, fh = [int(v) for v in faces[i]]
+    return (x + fw / 2.0, y + fh / 2.0)
+
+
+def crop_gallery_banner_face_centered_code_only(image_bytes: bytes) -> Image.Image:
+    """
+    Deterministic crop + resize only: no generative model. Fits aspect GALLERY_WIDTH:GALLERY_HEIGHT,
+    uses largest detected frontal face to center the crop (fallback: image center).
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if w < 2 or h < 2:
+        raise ValueError("Image too small to crop.")
+
+    r_out = GALLERY_WIDTH / GALLERY_HEIGHT
+    fc = _face_center_from_image_rgb(img)
+    if fc is not None:
+        fx, fy = fc
+    else:
+        fx, fy = w / 2.0, h / 2.0
+
+    # Maximal axis-aligned crop inside (w,h) with aspect w_crop/h_crop = r_out
+    if (w / h) >= r_out:
+        crop_h = h
+        crop_w = int(round(crop_h * r_out))
+        if crop_w > w:
+            crop_w = w
+            crop_h = int(round(crop_w / r_out))
+    else:
+        crop_w = w
+        crop_h = int(round(crop_w / r_out))
+        if crop_h > h:
+            crop_h = h
+            crop_w = int(round(crop_h * r_out))
+
+    crop_w = max(1, min(crop_w, w))
+    crop_h = max(1, min(crop_h, h))
+
+    left = int(round(fx - crop_w / 2.0))
+    top = int(round(fy - crop_h / 2.0))
+    left = max(0, min(left, w - crop_w))
+    top = max(0, min(top, h - crop_h))
+
+    cropped = img.crop((left, top, left + crop_w, top + crop_h))
+    return cropped.resize((GALLERY_WIDTH, GALLERY_HEIGHT), Image.Resampling.LANCZOS)
+
+
+def prepare_gallery_webp_exact_rgb(img: Image.Image) -> tuple[bytes, bool]:
+    """Encode already GALLERY-sized RGB image to WebP under size cap (no geometric crop)."""
+    if img.size != (GALLERY_WIDTH, GALLERY_HEIGHT):
+        img = img.resize((GALLERY_WIDTH, GALLERY_HEIGHT), Image.Resampling.LANCZOS)
+    size_limit = GALLERY_MAX_SIZE_KB * 1024
+    last_bytes = None
+    for quality in [95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30]:
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=quality, method=6, optimize=True)
+        candidate = buf.getvalue()
+        last_bytes = candidate
+        if len(candidate) <= size_limit:
+            return candidate, True
+    return last_bytes or b"", False
 
 
 def _prepare_thumb_for_vision(image_bytes: bytes, max_edge: int = 384) -> tuple[bytes, str]:
@@ -198,7 +288,8 @@ Strong emotion or gesture: mid-speech, laugh, raised hand, performing energy —
 
 ## Hard checks (must pass for a top pick unless no better option exists)
 - **Identity**: Main subject should plausibly be **{celebrity_name}** (reject obvious wrong person).
-- **One clear subject**: Exactly **one** dominant person (or one clear performer); not group collages or multi-panel images.
+- **Exactly one person (strict)**: There must be **only one** human subject treated as the star of the photo. Reject: duets or two+ people sharing the frame with **similar prominence** (side-by-side presenters, couple shots, two faces large in frame), collages / split panels / before-after layouts, or any image where a **second person's face** is clearly visible at roughly **≥ ~40%** the size of the main subject's face. **Acceptable**: one clear subject with a **distant, out-of-focus crowd** or tiny background figures where no second individual reads as a co-subject.
+- **One clear focal performer**: Not group collages or multi-panel images; not "cast photo" style with multiple faces along a line at similar scale.
 - **Face**: Face **clearly visible** and sharp enough (not tiny silhouette, not heavy occlusion).
 - **Clarity**: Not extremely blurry, dark, or low-res.
 - **Text**: Reject heavy overlaid text, meme text, news banners, big watermarks; tiny corner logos OK.
@@ -207,7 +298,9 @@ Strong emotion or gesture: mid-speech, laugh, raised hand, performing energy —
 Prefer width ÷ height near **{target_ratio_str}** for a wide gallery strip; avoid extreme vertical crops if you have alternatives.
 
 ## Your task
-Pick exactly **{top_k}** distinct indices that **best** match the **event/action** brief (Types 1–4) while passing the hard checks. Prefer TYPE 1–4 over plain studio portraits.
+Pick exactly **{top_k}** distinct indices that **best** match the **event/action** brief (Types 1–4) while passing **all** hard checks — especially **exactly-one-person**. If fewer than {top_k} images qualify, still return **{top_k}** indices by filling with the **least-bad** remaining valid indices (never invent indices).
+
+Prioritise **single-subject** compliance over minor aspect-ratio mismatch.
 
 Respond ONLY with valid JSON (no markdown fences):
 {{
@@ -220,11 +313,11 @@ Respond ONLY with valid JSON (no markdown fences):
         messages=[
             {
                 "role": "system",
-                "content": "You are a strict event-photography editor. Output only valid JSON as requested.",
+                "content": "You are a strict event-photography editor. Enforce exactly-one-clear-subject per pick. Output only valid JSON as requested.",
             },
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
-        max_tokens=600,
+        max_tokens=900,
         temperature=0,
     )
 
@@ -266,9 +359,17 @@ Respond ONLY with valid JSON (no markdown fences):
     return out[:top_k], None
 
 
-def resize_and_crop_to_fill(img: Image.Image, target_width: int, target_height: int) -> Image.Image:
+def resize_and_crop_to_fill(
+    img: Image.Image,
+    target_width: int,
+    target_height: int,
+    horizontal_focus: float = 0.5,
+    vertical_focus: float = 0.5,
+) -> Image.Image:
     """
-    Resize while preserving aspect ratio, then center-crop to exact target size.
+    Resize while preserving aspect ratio, then crop to exact target size.
+    `horizontal_focus` / `vertical_focus` are in [0, 1] and control where the crop
+    window is anchored (0=start/top, 0.5=center, 1=end/bottom).
     """
     src_w, src_h = img.size
     target_ratio = target_width / target_height
@@ -285,8 +386,13 @@ def resize_and_crop_to_fill(img: Image.Image, target_width: int, target_height: 
 
     resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    left = max(0, (new_w - target_width) // 2)
-    top = max(0, (new_h - target_height) // 2)
+    horizontal_focus = min(max(horizontal_focus, 0.0), 1.0)
+    vertical_focus = min(max(vertical_focus, 0.0), 1.0)
+
+    max_left = max(0, new_w - target_width)
+    max_top = max(0, new_h - target_height)
+    left = int(round(max_left * horizontal_focus))
+    top = int(round(max_top * vertical_focus))
     right = left + target_width
     bottom = top + target_height
 
@@ -298,6 +404,8 @@ def prepare_webp_with_constraints(
     width: int,
     height: int,
     max_size_kb: int,
+    horizontal_focus: float = 0.5,
+    vertical_focus: float = 0.5,
 ) -> tuple[bytes, bool]:
     """
     Convert generated image to exact output spec (size + format constraints).
@@ -306,7 +414,13 @@ def prepare_webp_with_constraints(
       (webp_bytes, is_within_size_limit)
     """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    processed = resize_and_crop_to_fill(img, width, height)
+    processed = resize_and_crop_to_fill(
+        img,
+        width,
+        height,
+        horizontal_focus=horizontal_focus,
+        vertical_focus=vertical_focus,
+    )
     size_limit = max_size_kb * 1024
 
     # Try descending quality levels; keep best effort if strict limit not reachable.
@@ -334,15 +448,21 @@ def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
         width=PROFILE_WIDTH,
         height=PROFILE_HEIGHT,
         max_size_kb=PROFILE_MAX_SIZE_KB,
+        horizontal_focus=0.5,
+        vertical_focus=0.5,
     )
 
 
 def prepare_gallery_webp(image_bytes: bytes) -> tuple[bytes, bool]:
+    # Keep crop slightly higher than center to avoid chopping foreheads/faces
+    # when portrait-oriented images are transformed into a wide banner.
     return prepare_webp_with_constraints(
         image_bytes=image_bytes,
         width=GALLERY_WIDTH,
         height=GALLERY_HEIGHT,
         max_size_kb=GALLERY_MAX_SIZE_KB,
+        horizontal_focus=0.5,
+        vertical_focus=0.25,
     )
 
 
@@ -638,48 +758,6 @@ Regenerate this gallery image with a face that EXACTLY matches the canonical fac
     raise RuntimeError("Gemini did not return a gallery image in its response.")
 
 
-def regenerate_reference_clean_gemini(source_image_bytes: bytes) -> bytes:
-    """
-    Gemini image model: faithful cleanup of one reference photo — remove text/watermarks,
-    keep people and scene unchanged. Caller applies exact WebP export (1176×516, size cap).
-    """
-    client = get_gemini_client()
-    pil_img = Image.open(io.BytesIO(source_image_bytes)).convert("RGB")
-    contents: list = [
-        pil_img,
-        """You are given ONE photograph below.
-
-Produce a cleaned version of THE SAME photograph for a wide website gallery banner.
-
-STRICT RULES (highest priority):
-1. **Identity lock**: Keep every person identical — same face, age, skin tone, hair, expression, pose, and body proportions. Do NOT beautify, de-age, slim, or change facial features.
-2. **Scene lock**: Keep clothing, environment, lighting direction, and overall colour faithful. This is restoration, not a re-shoot or art-style change.
-3. **Text removal only**: Remove overlaid text, captions, subtitles, news banners, channel logos, stock watermarks, meme text, and UI typography. Inpaint those regions so textures match surroundings naturally.
-4. **No text output**: The final image must contain **no readable letters, numbers, words, or logos** anywhere (including corners). Do NOT add watermarks or branding.
-5. **No new elements**: Do not add objects, people, or text. Do not crop off heads or key parts of the subject.
-6. **Format intent**: Single wide horizontal photorealistic image at high resolution (will be resized to ~1176×516 later — keep content suitable for a wide banner).
-
-If the source has no text, return a near-identical, slightly sharpened horizontal version only.""",
-    ]
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-        ),
-    )
-
-    if not response.candidates:
-        raise RuntimeError("Gemini returned no candidates (blocked or empty response).")
-
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            return part.inline_data.data
-
-    raise RuntimeError("Gemini did not return a cleaned image.")
-
-
 # ---------------------------------------------------------------------------
 # GUARDRAIL 2 – Output quality check
 # ---------------------------------------------------------------------------
@@ -826,8 +904,16 @@ if "result_data" not in st.session_state:
     st.session_state.result_data = None
 if "reference_pool_rows" not in st.session_state:
     st.session_state.reference_pool_rows = None
-if "reference_top6_indices" not in st.session_state:
-    st.session_state.reference_top6_indices = None
+if "reference_top_indices" not in st.session_state:
+    st.session_state.reference_top_indices = None
+# Migrate / drop old session key (before `reference_top_indices` rename)
+if "reference_top6_indices" in st.session_state:
+    if (
+        st.session_state.reference_top6_indices is not None
+        and st.session_state.reference_top_indices is None
+    ):
+        st.session_state.reference_top_indices = st.session_state.reference_top6_indices
+    del st.session_state["reference_top6_indices"]
 if "reference_rank_note" not in st.session_state:
     st.session_state.reference_rank_note = None
 if "reference_regenerated" not in st.session_state:
@@ -838,13 +924,13 @@ st.divider()
 st.subheader(f"Reference image pool (~{REFERENCE_IMAGE_POOL_SIZE} via SerpApi)")
 st.caption(
     f"SerpApi searches favour **live event / action** shots (stage, audience, candid, expressive). "
-    f"Then **GPT-4o** picks **{REFERENCE_TOP_K_OPENAI}** using **four event types**, single clear subject, visible face, low text, "
+    f"Then **GPT-4o** picks **{REFERENCE_TOP_K_OPENAI}** using **four event types**, **exactly one person** per pick, visible face, low text, "
     f"plus banner aspect ~{GALLERY_WIDTH}×{GALLERY_HEIGHT}. "
     "Set `SERPAPI_API_KEY` and `OPENAI_API_KEY` in `.env`."
 )
 if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_serpapi_pool", use_container_width=False):
     st.session_state.reference_pool_rows = None
-    st.session_state.reference_top6_indices = None
+    st.session_state.reference_top_indices = None
     st.session_state.reference_rank_note = None
     st.session_state.reference_regenerated = None
     if not artist_name.strip():
@@ -877,9 +963,12 @@ if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_ser
                         if not url:
                             continue
                         try:
-                            data = download_image_bytes(url)
-                            if data and len(data) > 500:
+                            candidate = download_image_bytes(url)
+                            ok, decode_err = is_valid_image_bytes(candidate) if candidate else (False, "No data")
+                            if candidate and len(candidate) > 500 and ok:
+                                data = candidate
                                 break
+                            err = decode_err or "Downloaded bytes are not a valid image"
                         except Exception as ex:
                             err = str(ex)
                             data = None
@@ -900,16 +989,16 @@ if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (SerpApi)", key="btn_ser
 
                 ta = GALLERY_WIDTH / GALLERY_HEIGHT
                 try:
-                    top6, rank_err = rank_reference_images_openai(
+                    top_indices, rank_err = rank_reference_images_openai(
                         rows,
                         artist_name.strip(),
                         ta,
                         top_k=REFERENCE_TOP_K_OPENAI,
                     )
                 except Exception as e:
-                    top6 = _fallback_top_indices_by_aspect(rows, ta, REFERENCE_TOP_K_OPENAI)
+                    top_indices = _fallback_top_indices_by_aspect(rows, ta, REFERENCE_TOP_K_OPENAI)
                     rank_err = f"OpenAI ranking failed ({e}); used aspect-ratio fallback."
-                st.session_state.reference_top6_indices = top6
+                st.session_state.reference_top_indices = top_indices
                 st.session_state.reference_rank_note = rank_err
 
 if st.session_state.reference_pool_rows:
@@ -927,47 +1016,55 @@ if st.session_state.reference_pool_rows:
                 cap_parts.append(f"r={row['aspect_ratio']:.2f}")
             caption = " · ".join(cap_parts)
             if row.get("bytes"):
-                st.image(row["bytes"], caption=caption, use_container_width=True)
+                try:
+                    st.image(row["bytes"], caption=caption, use_container_width=True)
+                except Exception as ex:
+                    st.warning(f"{caption}\nPreview failed: {ex}")
             else:
                 st.warning(f"{caption}\nCould not load: {row.get('error', 'unknown')}")
             if row.get("link"):
                 st.markdown(f"[Open source]({row['link']})")
 
-    top6 = st.session_state.reference_top6_indices
-    if top6:
+    top_indices = st.session_state.reference_top_indices
+    if top_indices:
         st.divider()
         st.subheader(f"Top {REFERENCE_TOP_K_OPENAI} (OpenAI ranked)")
         if st.session_state.reference_rank_note:
             st.caption(st.session_state.reference_rank_note)
         pool = st.session_state.reference_pool_rows
-        cols6 = st.columns(3)
-        for j, pool_idx in enumerate(top6):
+        cols_top = st.columns(5)
+        for j, pool_idx in enumerate(top_indices):
             if pool_idx < 0 or pool_idx >= len(pool):
                 continue
             row = pool[pool_idx]
-            with cols6[j % 3]:
+            with cols_top[j % 5]:
                 cap = f"Pick #{j + 1} · pool idx {pool_idx}"
                 if row.get("bytes"):
-                    st.image(row["bytes"], caption=cap, use_container_width=True)
+                    try:
+                        st.image(row["bytes"], caption=cap, use_container_width=True)
+                    except Exception as ex:
+                        st.warning(f"{cap} — preview failed: {ex}")
                 else:
                     st.warning(f"{cap} — missing bytes")
                 if row.get("link"):
                     st.markdown(f"[Open source]({row['link']})")
 
         st.caption(
-            f"Gemini re-renders each pick: removes text/watermarks, keeps people unchanged, "
-            f"then exports **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** `.webp` (target **≤{GALLERY_MAX_SIZE_KB} KB** each)."
+            f"**Crop only (no generative model)**: OpenCV face detection centers the crop, then a hard **crop + resize** "
+            f"to **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** (same pixels as the source, only geometry). "
+            f"**WebP**: Pillow encodes under **≤{GALLERY_MAX_SIZE_KB} KB** when possible. "
+            "Text/watermarks are not removed here (that would require inpainting)."
         )
         if st.button(
-            f"Regenerate top {REFERENCE_TOP_K_OPENAI} with Gemini (clean + WebP)",
-            key="btn_regen_top6_gemini",
+            f"Process top {REFERENCE_TOP_K_OPENAI} (face-centered crop + WebP)",
+            key="btn_top10_crop_webp",
             use_container_width=False,
         ):
             st.session_state.reference_regenerated = None
             pool = st.session_state.reference_pool_rows
             regen_out: list[dict] = []
-            with st.spinner(f"Gemini + WebP: processing {len(top6)} images…"):
-                for j, pool_idx in enumerate(top6):
+            with st.spinner(f"Cropping + WebP: processing {len(top_indices)} images..."):
+                for j, pool_idx in enumerate(top_indices):
                     if pool_idx < 0 or pool_idx >= len(pool):
                         regen_out.append(
                             {
@@ -992,8 +1089,8 @@ if st.session_state.reference_pool_rows:
                         )
                         continue
                     try:
-                        raw = regenerate_reference_clean_gemini(src)
-                        webp_b, ok = prepare_gallery_webp(raw)
+                        rgb_banner = crop_gallery_banner_face_centered_code_only(src)
+                        webp_b, ok = prepare_gallery_webp_exact_rgb(rgb_banner)
                         if not webp_b:
                             raise RuntimeError("WebP export failed")
                         regen_out.append(
@@ -1020,14 +1117,14 @@ if st.session_state.reference_pool_rows:
     regen = st.session_state.reference_regenerated
     if regen:
         st.divider()
-        st.subheader("Gemini-cleaned gallery exports")
+        st.subheader("Gallery exports (face-centered crop + WebP)")
         st.caption(
-            f"Each image: **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** WebP. "
+            f"Each image: **{GALLERY_WIDTH}×{GALLERY_HEIGHT}** WebP (crop + resize only). "
             f"Green caption = within {GALLERY_MAX_SIZE_KB} KB; otherwise best-effort compression."
         )
-        rcols = st.columns(3)
+        rcols = st.columns(5)
         for j, item in enumerate(regen):
-            with rcols[j % 3]:
+            with rcols[j % 5]:
                 slot = item.get("slot", j + 1)
                 if item.get("webp_bytes"):
                     kb = len(item["webp_bytes"]) / 1024
