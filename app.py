@@ -616,13 +616,13 @@ CRITICAL REQUIREMENTS:
 
 4. **Lighting**: Soft, diffused studio lighting with natural shadows under the chin and along the jawline. A subtle rim light or catch-light in the eyes to add depth. The lighting direction must be consistent between the person and the background glow.
 
-5. **Framing — MUST show full head-to-shoulders**: This is a MEDIUM HEADSHOT, NOT a face close-up. The frame MUST include:
-   - Full head with visible headroom above the hair (do NOT crop the top of the head)
+5. **Framing — MUST show full head-to-shoulders WITH GENEROUS HEADROOM**: This is a MEDIUM HEADSHOT, NOT a face close-up. The frame MUST include:
+   - Full head with SIGNIFICANT empty space ABOVE the hair — the top of the head must NOT be near the top edge of the frame. There must be a clear, generous band of background visible above the hair (roughly 20-30% of the frame's vertical height should be empty background above the head).
    - Full face from forehead to chin
    - Full neck
    - BOTH shoulders entirely visible within the frame
    - The top portion of the clothing (collar, neckline, shirt/blazer top) clearly visible
-   The face should occupy roughly 35-45% of the frame vertically — NOT fill the entire frame. Think classic LinkedIn profile picture composition: you can clearly see the shoulders and collar, not just the face. Slightly angled pose, not straight-on.
+   The face should occupy roughly 30-40% of the frame vertically — NOT fill the entire frame. Think classic LinkedIn profile picture composition with airy, breathing room above the head: you can clearly see the shoulders, collar, AND a noticeable amount of background sky/gradient above the hair. Slightly angled pose, not straight-on.
 
 6. **Expression**: A natural, warm, confident expression — a slight smile is ideal.
 
@@ -642,8 +642,8 @@ CRITICAL REQUIREMENTS:
 
 10. **Final composition rule**: Highlight the face area using soft, natural shading as per the style reference. Keep the subject centered in the frame, ensure the full head is visible with no head cropping, and maintain a horizontal orientation suitable for a website profile image.
 11. **Face-centering constraints (strict)**:
-   - Keep both eyes around the upper-third horizontal band of the frame (rule of thirds).
-   - Leave approximately 8-12% headroom above the hair/top of head.
+   - Position the eyes around the MIDDLE horizontal band of the frame (around the 50% vertical line), NOT the upper third — this pushes the head DOWN in the frame and leaves substantial empty space above the head.
+   - Leave approximately 20-30% HEADROOM above the hair/top of head — this is a hard requirement. The top of the hair should sit roughly 20-30% down from the top edge of the frame, with clean gradient background filling that space above. A LinkedIn profile picture with the head pressed against the top of the frame is WRONG.
    - Do NOT crop hair, forehead, chin, jawline, neck, or shoulders.
    - Both shoulders must be fully inside the frame with a small margin on each side.
    - The subject should occupy roughly 50-60% of frame width — leaving visible gradient background on both sides of the person.
