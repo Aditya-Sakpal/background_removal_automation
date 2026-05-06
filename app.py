@@ -589,9 +589,12 @@ def generate_linkedin_image(
     style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
     contents.append(style_ref)
     contents.append(
-        "Above is the STYLE REFERENCE image. The final output must match this "
-        "exact style — notice how the person, lighting, and gradient background "
-        "all feel like a single cohesive photograph, not a cutout pasted on a background."
+        "Above is the STYLE REFERENCE image. Use it ONLY for one purpose: how the "
+        "person, lighting, and background feel like a single cohesive photograph "
+        "(not a cutout pasted on a background). DO NOT copy the colour, brightness, "
+        "or vignette of this reference. The output background must be BRIGHT and "
+        "UNIFORM with NO dark vignette — follow the explicit background rules in "
+        "the text prompt below, NOT this reference's mood."
     )
 
     # 2. User's input photos
@@ -612,17 +615,25 @@ CRITICAL REQUIREMENTS:
 
 2. **Natural blending**: The person and background must look like they belong together — as if this photo was taken in a professional studio. The lighting on the person's face and body must match the ambient light of the background. Edges around hair, shoulders, and clothing must blend softly and naturally into the background with no harsh cutout lines.
 
-3. **Background**: A smooth radial or linear gradient background. The gradient colours should complement the person's clothing. Dark edges fading to a lighter centre, or a rich colour that harmonises with their outfit (similar to the style reference image).
+3. **Background — BRIGHT, UNIFORM, NO VIGNETTE (mandatory)**: The background must be a clean, evenly-lit, vivid solid colour with only a VERY SUBTLE soft highlight near the upper-centre (as if a soft light is gently illuminating the backdrop from above). The colour should be a rich, saturated, professional tone that complements the person's clothing — for example a deep royal blue, a clean teal, a warm grey-blue, or a similar polished hue.
+
+   STRICT requirements:
+   - The background must look BRIGHT and EVEN across the whole frame.
+   - The four corners must be roughly the SAME tone as the rest of the background — only marginally darker, if at all.
+   - DO NOT create a dark vignette. DO NOT darken the edges or corners.
+   - DO NOT create a moody "spotlight" effect with a bright centre fading into black/dark edges.
+   - DO NOT use a heavy radial gradient where the centre is much brighter than the edges.
+   - The transition from the slight highlight to the rest of the background must be very gentle and almost imperceptible — the overall impression must be "uniform clean colour", not "dramatic studio vignette".
+   - Think of a bright, modern LinkedIn profile photo backdrop, NOT a moody portrait studio with heavy edge falloff.
 
 4. **Lighting**: Soft, diffused studio lighting with natural shadows under the chin and along the jawline. A subtle rim light or catch-light in the eyes to add depth. The lighting direction must be consistent between the person and the background glow.
 
-5. **Framing — MUST show full head-to-shoulders WITH GENEROUS HEADROOM**: This is a MEDIUM HEADSHOT, NOT a face close-up. The frame MUST include:
-   - Full head with SIGNIFICANT empty space ABOVE the hair — the top of the head must NOT be near the top edge of the frame. There must be a clear, generous band of background visible above the hair (roughly 20-30% of the frame's vertical height should be empty background above the head).
-   - Full face from forehead to chin
-   - Full neck
-   - BOTH shoulders entirely visible within the frame
-   - The top portion of the clothing (collar, neckline, shirt/blazer top) clearly visible
-   The face should occupy roughly 30-40% of the frame vertically — NOT fill the entire frame. Think classic LinkedIn profile picture composition with airy, breathing room above the head: you can clearly see the shoulders, collar, AND a noticeable amount of background sky/gradient above the hair. Slightly angled pose, not straight-on.
+5. **Framing — RULE-OF-THIRDS COMPOSITION (mandatory)**: Imagine the output frame divided into a 3×3 grid. The composition MUST follow these strict rules:
+   - **Top of head**: The very top of the hair must sit JUST BELOW the upper horizontal third line (i.e. roughly 35-40% down from the top edge of the frame). The ENTIRE upper third of the frame must be empty gradient background — NO part of the head should poke into the top third.
+   - **Headroom**: A generous, clean band of gradient background fills the entire upper third above the hair.
+   - **Face**: Full face (forehead, eyes, nose, mouth, chin) sits within the middle horizontal third of the frame.
+   - **Shoulders & clothing**: Both shoulders fully visible in the lower portion of the frame, with the collar / neckline / top of the shirt or blazer clearly visible.
+   - The face should occupy roughly 30-40% of the frame's vertical height — large enough to be the focal point but with significant breathing room above. Slightly angled pose, not straight-on.
 
 6. **Expression**: A natural, warm, confident expression — a slight smile is ideal.
 
@@ -640,14 +651,14 @@ CRITICAL REQUIREMENTS:
 
 9. **Clothing — DO NOT CHANGE**: The person MUST wear the EXACT same clothing as in the subject photos. Same colour, same style, same neckline, same pattern, same fabric. Do NOT replace, alter, or upgrade the clothing in any way. If the person is wearing a t-shirt, keep the t-shirt — do NOT swap it for a blazer or formal shirt. Render the clothing with visible fabric weave, proper folds, creases, and shadows.
 
-10. **Final composition rule**: Highlight the face area using soft, natural shading as per the style reference. Keep the subject centered in the frame, ensure the full head is visible with no head cropping, and maintain a horizontal orientation suitable for a website profile image.
-11. **Face-centering constraints (strict)**:
-   - Position the eyes around the MIDDLE horizontal band of the frame (around the 50% vertical line), NOT the upper third — this pushes the head DOWN in the frame and leaves substantial empty space above the head.
-   - Leave approximately 20-30% HEADROOM above the hair/top of head — this is a hard requirement. The top of the hair should sit roughly 20-30% down from the top edge of the frame, with clean gradient background filling that space above. A LinkedIn profile picture with the head pressed against the top of the frame is WRONG.
-   - Do NOT crop hair, forehead, chin, jawline, neck, or shoulders.
-   - Both shoulders must be fully inside the frame with a small margin on each side.
-   - The subject should occupy roughly 50-60% of frame width — leaving visible gradient background on both sides of the person.
-   - Avoid off-center framing unless needed for natural pose balance.
+10. **Final composition rule**: Highlight the face area using soft, natural shading as per the style reference. Maintain a horizontal orientation suitable for a website profile image.
+11. **Composition constraints (strict — non-negotiable)**:
+   - **HEADROOM (hard rule)**: The top of the hair MUST sit just BELOW the upper-third horizontal line — roughly 35-40% down from the top edge of the frame. The entire upper third of the frame MUST be empty gradient background. A LinkedIn profile picture with the head pressed near the top of the frame is WRONG. A LinkedIn profile picture with the head TOP above the upper-third line is WRONG.
+   - **Eye line**: With this headroom, the eyes naturally fall around the middle horizontal band of the frame (≈45-55% from the top).
+   - **HORIZONTAL CENTRE (hard rule)**: The vertical centre line of the subject's face and body MUST coincide with the vertical centre line of the frame. The subject must be perfectly centred horizontally — equal gradient background on the left and right of the person. NO off-centre composition. NO biased framing left or right.
+   - **No cropping**: Do NOT crop hair, forehead, chin, jawline, neck, or shoulders.
+   - Both shoulders fully inside the frame with a small symmetric margin on each side.
+   - Subject occupies roughly 50-60% of frame width.
 
 Output a single LANDSCAPE image at a 3:2 aspect ratio (wider than tall) at the highest possible quality and resolution. The full head and both shoulders MUST fit within this landscape frame with visible gradient background on left and right sides. The final image must look like it was taken by a professional photographer with a high-end camera — not generated by AI."""
 
