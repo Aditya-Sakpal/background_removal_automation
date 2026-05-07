@@ -20,6 +20,7 @@ from google_images import (
     download_image_bytes,
     fetch_google_image_candidates,
 )
+from serpapi_images import fetch_serpapi_image_candidates
 
 load_dotenv()
 
@@ -120,6 +121,108 @@ def is_valid_image_bytes(image_bytes: bytes) -> tuple[bool, str | None]:
         return True, None
     except Exception as e:
         return False, f"Invalid image bytes ({e})"
+
+
+class GeminiTransientError(RuntimeError):
+    """Transient Gemini generation failure that's safe to retry (e.g. IMAGE_OTHER)."""
+
+
+# Finish reasons that are flaky / non-deterministic and worth retrying.
+# Compared as strings so we don't rely on the SDK enum import.
+TRANSIENT_FINISH_REASONS = {"IMAGE_OTHER", "OTHER", "MAX_TOKENS"}
+
+
+def extract_image_from_gemini_response(response, context: str = "image") -> bytes:
+    """
+    Pull the inline image bytes from a Gemini generate_content response.
+    Raises GeminiTransientError for retryable failures, RuntimeError for permanent ones.
+    """
+    if response is None:
+        raise RuntimeError(f"Gemini returned no response while generating {context}.")
+
+    # Top-level prompt feedback (when the prompt itself is rejected).
+    pf = getattr(response, "prompt_feedback", None)
+    if pf is not None and getattr(pf, "block_reason", None):
+        raise RuntimeError(
+            f"Gemini blocked the prompt while generating {context}. "
+            f"Reason: {pf.block_reason}. Detail: {getattr(pf, 'block_reason_message', '')}"
+        )
+
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        raise RuntimeError(
+            f"Gemini returned no candidates for {context}. "
+            f"This usually means the prompt was blocked by safety filters."
+        )
+
+    cand = candidates[0]
+    finish_reason = getattr(cand, "finish_reason", None)
+    finish_str = str(finish_reason).split(".")[-1] if finish_reason is not None else ""
+    content = getattr(cand, "content", None)
+
+    if content is None or getattr(content, "parts", None) is None:
+        safety_ratings = getattr(cand, "safety_ratings", None)
+        msg = (
+            f"Gemini returned an empty response for {context} "
+            f"(finish_reason={finish_reason}). Safety ratings: {safety_ratings}"
+        )
+        if finish_str in TRANSIENT_FINISH_REASONS:
+            raise GeminiTransientError(msg)
+        raise RuntimeError(msg + " (likely safety filter on real-person inputs)")
+
+    text_seen = []
+    for part in content.parts:
+        if getattr(part, "inline_data", None) is not None:
+            return part.inline_data.data
+        text = getattr(part, "text", None)
+        if text:
+            text_seen.append(text)
+
+    text_blob = " | ".join(text_seen)[:300] if text_seen else "(no text)"
+    msg = (
+        f"Gemini did not return an image for {context} "
+        f"(finish_reason={finish_reason}). Model said: {text_blob}"
+    )
+    if finish_str in TRANSIENT_FINISH_REASONS:
+        raise GeminiTransientError(msg)
+    raise RuntimeError(msg)
+
+
+def call_gemini_with_retry(
+    client,
+    *,
+    model: str,
+    contents: list,
+    config,
+    context: str,
+    max_attempts: int = 3,
+) -> bytes:
+    """
+    Call generate_content and parse the image, retrying on transient errors
+    (IMAGE_OTHER, OTHER, MAX_TOKENS). Hard failures (safety, prompt block)
+    are raised immediately.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return extract_image_from_gemini_response(response, context=context)
+        except GeminiTransientError as e:
+            last_err = e
+            if attempt < max_attempts:
+                # tiny backoff so we don't hammer the API
+                import time
+
+                time.sleep(0.5 * attempt)
+                continue
+            break
+    raise RuntimeError(
+        f"Gemini failed {max_attempts} times for {context} (transient). Last error: {last_err}"
+    )
 
 
 def _face_center_from_image_rgb(img: Image.Image) -> tuple[float, float] | None:
@@ -462,64 +565,18 @@ def prepare_gallery_webp(image_bytes: bytes) -> tuple[bytes, bool]:
 def regenerate_gallery_image_nano_banana(
     source_image_bytes: bytes,
     *,
-    model: str = NANO_BANANA_REGEN_MODEL,
+    model: str = NANO_BANANA_REGEN_MODEL,  # kept for signature compat, unused
 ) -> bytes:
     """
-    Regenerate a gallery candidate with Nano Banana while preserving identity/scene:
-    - remove visible text/watermarks/logos
-    - keep person and scene otherwise unchanged
-    - return PNG bytes resized/cropped to exact 1176x516
+    Produce a gallery banner directly from the source SerpApi image — no Gemini edit.
+
+    The Gemini "edit a real-person photo" path silently refuses (IMAGE_OTHER) because
+    of deepfake / public-figure protections. Instead we use the source image as-is and
+    apply a deterministic, face-centered crop to 1176x516.
+
+    Returns PNG bytes at exactly GALLERY_WIDTH x GALLERY_HEIGHT.
     """
-    client = get_gemini_client()
-
-    src_img = Image.open(io.BytesIO(source_image_bytes)).convert("RGB")
-    src_w, src_h = src_img.size
-    src_ratio = src_w / max(src_h, 1)
-    target_ratio = GALLERY_WIDTH / GALLERY_HEIGHT
-    horizontal_focus = 0.5
-    vertical_focus = 0.5
-    if src_ratio < target_ratio:
-        # Wider crop from portrait-ish inputs: bias higher to protect head/face framing.
-        vertical_focus = 0.25
-
-    prompt = """Edit the provided image with minimal changes.
-
-STRICT REQUIREMENTS:
-1. Keep the exact same person and identity (face, body, pose, clothing, skin tone, hairstyle).
-2. Keep the same scene, camera angle, lighting, colors, and composition.
-3. Remove ALL visible text, logo, caption, subtitle, lower-third, and watermark from every area of the image.
-4. Text/watermark removal is mandatory. Replace removed regions naturally so no text fragments, ghosting, or logo artifacts remain.
-5. Do not add/remove people or objects unless needed for text/watermark cleanup.
-6. Do not stylize. Keep the result photorealistic and as close as possible to the source.
-
-Return one high-quality horizontal image."""
-
-    response = client.models.generate_content(
-        model=model,
-        contents=[src_img, prompt],
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio="21:9"),
-        ),
-    )
-
-    edited_bytes: bytes | None = None
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            edited_bytes = part.inline_data.data
-            break
-
-    if not edited_bytes:
-        raise RuntimeError("Nano Banana did not return an image payload.")
-
-    edited_img = Image.open(io.BytesIO(edited_bytes)).convert("RGB")
-    final_img = resize_and_crop_to_fill(
-        edited_img,
-        GALLERY_WIDTH,
-        GALLERY_HEIGHT,
-        horizontal_focus=horizontal_focus,
-        vertical_focus=vertical_focus,
-    )
+    final_img = crop_gallery_banner_face_centered_code_only(source_image_bytes)
     out = io.BytesIO()
     final_img.save(out, format="PNG")
     return out.getvalue()
@@ -679,20 +736,16 @@ Please regenerate the image addressing ALL of the above issues while keeping all
 
     contents.append(prompt_text)
 
-    response = client.models.generate_content(
+    return call_gemini_with_retry(
+        client,
         model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
             image_config=types.ImageConfig(aspect_ratio="3:2"),
         ),
+        context="profile image",
     )
-
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            return part.inline_data.data
-
-    raise RuntimeError("Gemini did not return an image in its response.")
 
 
 def generate_gallery_image(
@@ -812,20 +865,16 @@ Regenerate this gallery image with a face that EXACTLY matches the canonical fac
 
     contents.append(prompt_text)
 
-    response = client.models.generate_content(
+    return call_gemini_with_retry(
+        client,
         model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
             image_config=types.ImageConfig(aspect_ratio="21:9"),
         ),
+        context="gallery image",
     )
-
-    for part in response.candidates[0].content.parts:
-        if part.inline_data is not None:
-            return part.inline_data.data
-
-    raise RuntimeError("Gemini did not return a gallery image in its response.")
 
 
 # ---------------------------------------------------------------------------
