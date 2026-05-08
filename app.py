@@ -935,6 +935,91 @@ If none of the three rejection conditions apply, return is_approved=true and thi
 
 
 # ---------------------------------------------------------------------------
+# GUARDRAIL 2b – LinkedIn profile composition check (gradient / headroom / centering)
+# ---------------------------------------------------------------------------
+def linkedin_composition_guardrail(generated_image: bytes) -> dict:
+    """
+    Strictly checks the generated LinkedIn headshot against three composition rules:
+      1. Black gradient at the bottom (matching the gradient reference image).
+      2. Significant headroom above the subject's head (matching the head-space reference).
+      3. Subject is horizontally centered in the frame.
+
+    Returns {"is_approved": bool, "things_to_improve": str | False}.
+    On failure, things_to_improve contains an actionable, prompt-ready description
+    of what must change in the next regeneration attempt.
+    """
+    client = get_openai_client()
+
+    with open(GRADIENT_REFERENCE_PATH, "rb") as f:
+        gradient_ref_bytes = f.read()
+    with open(HEAD_SPACE_REFERENCE_PATH, "rb") as f:
+        head_space_ref_bytes = f.read()
+
+    image_content = [
+        {"type": "text", "text": "--- GRADIENT REFERENCE (background must fade to BLACK at the bottom like this) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(gradient_ref_bytes, "image/jpeg"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- HEAD-SPACE REFERENCE (this much empty background above the head, or more) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(head_space_ref_bytes, "image/png"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
+        },
+    ]
+
+    prompt = """You are a STRICT composition reviewer for AI-generated LinkedIn profile headshots.
+
+You are given THREE images:
+1. A gradient reference (showing the desired bottom-of-frame black gradient).
+2. A head-space reference (showing the desired amount of empty background above the head).
+3. The generated LinkedIn image to evaluate.
+
+You MUST evaluate the generated image against ONLY these three rules. Do not invent additional criteria. Do not flag face quality, clothing, lighting style, or anything not listed.
+
+RULES:
+
+1. **Black gradient at the bottom**: The background of the generated image must transition from a colour at the top to a clearly visible BLACK band along the bottom of the frame, similar to the gradient reference. The bottom ~25-40% of the background should noticeably darken into black. PASS if there is an obvious dark/black gradient at the bottom. FAIL if the background is a flat single colour with no dark bottom band, or only has a vignette in the corners, or fades to a non-black colour.
+
+2. **Significant headroom above the subject's head**: There must be a clear, generous band of empty background ABOVE the top of the subject's hair, comparable to the head-space reference. The top of the hair should sit roughly in the upper third of the frame (around 20-30% down from the top edge) — NOT pressed against the top of the frame. PASS if there is a clearly visible empty band of background above the head taking at least ~15% of the frame's vertical height. FAIL if the head is near the top of the frame, the hair touches or nearly touches the top edge, or there is little to no breathing room above the head.
+
+3. **Horizontal centering**: The subject (head and shoulders) must be horizontally centered in the frame, with roughly equal background space on the left and right of the person. PASS if the subject is centered or only very slightly off-center. FAIL if the subject is clearly shifted to the left or right side of the frame.
+
+For each FAILED rule, write a SHORT, SPECIFIC, ACTIONABLE instruction (one sentence each) that can be fed directly back to the image generator to fix the issue on the next attempt. Examples:
+- "Add a smooth black gradient across the bottom 30% of the background — the current background is a flat colour with no dark bottom band."
+- "Move the subject DOWN in the frame so the top of the hair sits in the upper third with at least 20% empty background above it — currently the head is pressed against the top edge."
+- "Recenter the subject horizontally — the person is currently shifted to the left/right of the frame."
+
+Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
+{
+    "gradient_pass": true or false,
+    "headroom_pass": true or false,
+    "centering_pass": true or false,
+    "is_approved": true or false,
+    "things_to_improve": false or "concatenated actionable fix instructions for every failed rule"
+}
+
+is_approved is true ONLY if ALL THREE rules pass. If any rule fails, is_approved is false and things_to_improve is the concatenated instructions for the failed rules."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a strict composition reviewer. Check ONLY the three rules listed. Respond only with JSON, no markdown fences."},
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=600,
+        temperature=0,
+    )
+
+    return parse_json_response(response.choices[0].message.content)
+
+
+# ---------------------------------------------------------------------------
 # GUARDRAIL 3 – Gallery face-match check
 # ---------------------------------------------------------------------------
 def gallery_face_match_guardrail(
@@ -1332,28 +1417,54 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.stop()
         status.update(label="Step 1/5 — Input guardrail passed", state="complete")
 
-    # Step 2: profile generation (single attempt, no retry)
+    # Step 2: profile generation with up to MAX_RETRY attempts.
+    # On each attempt we run two guardrails:
+    #   (a) output_guardrail — face resemblance / severe artifacts
+    #   (b) linkedin_composition_guardrail — black gradient bottom, headroom, centering
+    # If either fails we feed the feedback back to Gemini and regenerate.
+    # After MAX_RETRY attempts, the latest generated image is accepted as-is.
     generated_image = None
     output_check = None
+    composition_check = None
+    composition_feedback: str | None = None
     with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
-        try:
-            generated_image = generate_linkedin_image(images, None, custom_prompt)
-        except Exception as e:
-            st.error(f"Profile generation failed: {e}")
-            st.stop()
-        try:
-            output_check = output_guardrail(generated_image, images)
-        except Exception as e:
-            st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
-            output_check = {"is_approved": True, "things_to_improve": False}
-        if output_check.get("is_approved"):
-            status.update(label="Step 2/5 — Profile approved", state="complete")
-        else:
-            st.error(f"Profile failed output guardrail: {output_check.get('things_to_improve', 'unknown reason')}")
-            st.stop()
+        for attempt in range(1, MAX_RETRY + 1):
+            st.write(f"Attempt {attempt}/{MAX_RETRY}...")
+            try:
+                generated_image = generate_linkedin_image(images, composition_feedback, custom_prompt)
+            except Exception as e:
+                st.error(f"Profile generation failed: {e}")
+                st.stop()
+
+            try:
+                output_check = output_guardrail(generated_image, images)
+            except Exception as e:
+                st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
+                output_check = {"is_approved": True, "things_to_improve": False}
+            if not output_check.get("is_approved"):
+                st.error(f"Profile failed output guardrail: {output_check.get('things_to_improve', 'unknown reason')}")
+                st.stop()
+
+            try:
+                composition_check = linkedin_composition_guardrail(generated_image)
+            except Exception as e:
+                st.warning(f"Composition guardrail errored ({e}) — accepting current image.")
+                composition_check = {"is_approved": True, "things_to_improve": False}
+
+            if composition_check.get("is_approved"):
+                st.write(f"Composition guardrail passed on attempt {attempt}.")
+                break
+
+            improvements = composition_check.get("things_to_improve") or "Composition rules failed."
+            st.write(f"Composition guardrail failed on attempt {attempt}: {improvements}")
+            composition_feedback = improvements
+            if attempt == MAX_RETRY:
+                st.warning(f"Composition guardrail still failing after {MAX_RETRY} attempts — accepting the latest image as-is.")
+
         if generated_image is None:
             st.error("Profile generation failed.")
             st.stop()
+        status.update(label="Step 2/5 — Profile approved", state="complete")
 
     profile_webp_bytes, profile_within_limit = prepare_profile_webp(generated_image)
     if not profile_webp_bytes:
