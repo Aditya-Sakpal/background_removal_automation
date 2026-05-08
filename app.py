@@ -33,6 +33,7 @@ MAX_IMAGES = 3
 MAX_RETRY = 3
 STYLE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "1768222411704.jpg")
 HEAD_SPACE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "head_space_reference.png")
+GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "gradient_reference.jpg")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
 PROFILE_MAX_SIZE_KB = 50
@@ -664,7 +665,19 @@ def generate_linkedin_image(
         "background, their clothing, or any overlay text — copy ONLY the framing/headroom."
     )
 
-    # 3. User's input photos
+    # 3. Gradient reference — shows the black-bottom gradient we want
+    gradient_ref = Image.open(GRADIENT_REFERENCE_PATH).convert("RGB")
+    contents.append(gradient_ref)
+    contents.append(
+        "The third image is a BACKGROUND GRADIENT REFERENCE. Notice how the background "
+        "transitions smoothly from the chosen colour at the top into a deep black band "
+        "across the bottom of the frame. Replicate this top-to-bottom gradient in your "
+        "output: a clean colour at the top, fading smoothly to BLACK at the bottom. Do "
+        "NOT copy this person, their clothing, or the orange hue — copy ONLY the "
+        "vertical gradient pattern (top colour → black at bottom)."
+    )
+
+    # 4. User's input photos
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
@@ -690,10 +703,12 @@ Style notes:
 - Render natural skin texture (subtle pores, fine details) — avoid an airbrushed or plastic look.
 - Hair rendered with natural strands and volume, not a flat mass.
 
-Background:
-- A clean, vivid, evenly-lit solid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
-- A very subtle soft highlight near the upper-centre is fine.
-- Avoid a dark vignette or heavy radial falloff. The corners should be roughly the same tone as the rest of the background.
+Background — vertical gradient (match the gradient reference image #3):
+- The TOP portion of the background is a clean, vivid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
+- The background then transitions smoothly DOWNWARD into a rich, deep BLACK band across the bottom of the frame. The lower ~30-40% of the background should fade into black.
+- The transition between the top colour and the black bottom must be a smooth vertical gradient — no hard line, no banding.
+- Sides/corners follow the same vertical gradient (top = colour, bottom = black). This is a top-to-bottom gradient, not a radial vignette.
+- A subtle soft highlight near the upper-centre is fine.
 
 Composition (landscape 3:2):
 - The face takes around 25-35% of the frame's vertical height (smaller than you might default to — this is what creates the headroom).
