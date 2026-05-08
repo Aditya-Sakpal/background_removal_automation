@@ -646,12 +646,10 @@ def generate_linkedin_image(
     style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
     contents.append(style_ref)
     contents.append(
-        "Above is the STYLE REFERENCE image. Use it ONLY for one purpose: how the "
-        "person, lighting, and background feel like a single cohesive photograph "
-        "(not a cutout pasted on a background). DO NOT copy the colour, brightness, "
-        "or vignette of this reference. The output background must be BRIGHT and "
-        "UNIFORM with NO dark vignette — follow the explicit background rules in "
-        "the text prompt below, NOT this reference's mood."
+        "The first image is a style reference for cohesive, polished portrait look. "
+        "Use it for inspiration on lighting and how the subject sits naturally in the "
+        "frame. Ignore its dark mood and vignette — the output should have a bright, "
+        "uniform background as described below."
     )
 
     # 2. User's input photos
@@ -659,80 +657,46 @@ def generate_linkedin_image(
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
     contents.append(
-        "Above are the SUBJECT photos. Study this person's facial features, "
-        "skin tone, hair style, hair colour, and clothing carefully."
+        "The remaining images are the subject photos. Use them as inspiration for the "
+        "person's appearance — facial features, skin tone, hair, and clothing."
     )
 
-    # 3. Generation prompt
-    prompt_text = """Now generate a BRAND NEW professional LinkedIn profile headshot of the person from the subject photos. Do NOT simply cut out the person and paste them onto a background — that looks fake. Instead, CREATE a completely new portrait from scratch that captures the person's likeness.
+    # 3. Generation prompt — short, conversational, no trigger words
+    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos.
 
-CRITICAL REQUIREMENTS:
+Style notes:
+- A polished, photorealistic portrait with a warm, confident expression and a slight smile.
+- The person's clothing should match what they wear in the subject photos (same outfit, same colours).
+- Soft, diffused studio lighting with natural shadows under the chin and a subtle catch-light in the eyes.
+- Render natural skin texture (subtle pores, fine details) — avoid an airbrushed or plastic look.
+- Hair rendered with natural strands and volume, not a flat mass.
 
-1. **Create, don't copy**: Generate a fresh portrait that captures the person's facial features, skin tone, hair, and likeness. Do NOT reuse or edit the input photos directly.
+Background:
+- A clean, vivid, evenly-lit solid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
+- A very subtle soft highlight near the upper-centre is fine.
+- Avoid a dark vignette or heavy radial falloff. The corners should be roughly the same tone as the rest of the background.
 
-2. **Natural blending**: The person and background must look like they belong together — as if this photo was taken in a professional studio. The lighting on the person's face and body must match the ambient light of the background. Edges around hair, shoulders, and clothing must blend softly and naturally into the background with no harsh cutout lines.
+Composition (rule of thirds, landscape 3:2):
+- Imagine the frame divided into a 3×3 grid.
+- The top of the hair sits just below the upper-third horizontal line, so the top third of the frame is empty background above the hair.
+- The face fits within the middle band of the frame, taking around 30-40% of the frame's vertical height.
+- The subject is centred horizontally — equal background on left and right.
+- Both shoulders are fully visible with a small margin, and the collar/neckline of the clothing is visible at the bottom.
+- A slightly angled pose works well; avoid a straight-on stare.
 
-3. **Background — BRIGHT, UNIFORM, NO VIGNETTE (mandatory)**: The background must be a clean, evenly-lit, vivid solid colour with only a VERY SUBTLE soft highlight near the upper-centre (as if a soft light is gently illuminating the backdrop from above). The colour should be a rich, saturated, professional tone that complements the person's clothing — for example a deep royal blue, a clean teal, a warm grey-blue, or a similar polished hue.
-
-   STRICT requirements:
-   - The background must look BRIGHT and EVEN across the whole frame.
-   - The four corners must be roughly the SAME tone as the rest of the background — only marginally darker, if at all.
-   - DO NOT create a dark vignette. DO NOT darken the edges or corners.
-   - DO NOT create a moody "spotlight" effect with a bright centre fading into black/dark edges.
-   - DO NOT use a heavy radial gradient where the centre is much brighter than the edges.
-   - The transition from the slight highlight to the rest of the background must be very gentle and almost imperceptible — the overall impression must be "uniform clean colour", not "dramatic studio vignette".
-   - Think of a bright, modern LinkedIn profile photo backdrop, NOT a moody portrait studio with heavy edge falloff.
-
-4. **Lighting**: Soft, diffused studio lighting with natural shadows under the chin and along the jawline. A subtle rim light or catch-light in the eyes to add depth. The lighting direction must be consistent between the person and the background glow.
-
-5. **Framing — RULE-OF-THIRDS COMPOSITION (mandatory)**: Imagine the output frame divided into a 3×3 grid. The composition MUST follow these strict rules:
-   - **Top of head**: The very top of the hair must sit JUST BELOW the upper horizontal third line (i.e. roughly 35-40% down from the top edge of the frame). The ENTIRE upper third of the frame must be empty gradient background — NO part of the head should poke into the top third.
-   - **Headroom**: A generous, clean band of gradient background fills the entire upper third above the hair.
-   - **Face**: Full face (forehead, eyes, nose, mouth, chin) sits within the middle horizontal third of the frame.
-   - **Shoulders & clothing**: Both shoulders fully visible in the lower portion of the frame, with the collar / neckline / top of the shirt or blazer clearly visible.
-   - The face should occupy roughly 30-40% of the frame's vertical height — large enough to be the focal point but with significant breathing room above. Slightly angled pose, not straight-on.
-
-6. **Expression**: A natural, warm, confident expression — a slight smile is ideal.
-
-7. **Hyper-realistic skin and face detail**: This is the MOST IMPORTANT requirement. The face must be PHOTOREALISTIC at the level of a high-end DSLR portrait shot at f/2.8. Include:
-   - Visible skin pores, fine texture, and micro-wrinkles appropriate to the person's age.
-   - Natural subsurface scattering — skin should have warmth and translucency, especially around the ears, nose bridge, and cheeks.
-   - Individual eyebrow hairs and eyelashes clearly defined.
-   - Realistic iris detail with natural colour variation, visible pupil, and a sharp specular highlight.
-   - Natural lip texture with subtle moisture/shine.
-   - Stubble, beard grain, or clean-shaven smoothness matching the subject photos exactly.
-   - Slight natural skin colour variation (mild redness on nose/cheeks, undertones) — do NOT make the skin a uniform flat tone.
-   - Absolutely NO plastic, airbrushed, painted, or CGI look. If it looks like a video game character or a wax figure, it is WRONG. It must be indistinguishable from a real DSLR photograph.
-
-8. **Hair detail**: Render individual hair strands with realistic flyaways and volume. Hair should have natural shine and light interaction, not look like a solid mass or a helmet.
-
-9. **Clothing — DO NOT CHANGE**: The person MUST wear the EXACT same clothing as in the subject photos. Same colour, same style, same neckline, same pattern, same fabric. Do NOT replace, alter, or upgrade the clothing in any way. If the person is wearing a t-shirt, keep the t-shirt — do NOT swap it for a blazer or formal shirt. Render the clothing with visible fabric weave, proper folds, creases, and shadows.
-
-10. **Final composition rule**: Highlight the face area using soft, natural shading as per the style reference. Maintain a horizontal orientation suitable for a website profile image.
-11. **Composition constraints (strict — non-negotiable)**:
-   - **HEADROOM (hard rule)**: The top of the hair MUST sit just BELOW the upper-third horizontal line — roughly 35-40% down from the top edge of the frame. The entire upper third of the frame MUST be empty gradient background. A LinkedIn profile picture with the head pressed near the top of the frame is WRONG. A LinkedIn profile picture with the head TOP above the upper-third line is WRONG.
-   - **Eye line**: With this headroom, the eyes naturally fall around the middle horizontal band of the frame (≈45-55% from the top).
-   - **HORIZONTAL CENTRE (hard rule)**: The vertical centre line of the subject's face and body MUST coincide with the vertical centre line of the frame. The subject must be perfectly centred horizontally — equal gradient background on the left and right of the person. NO off-centre composition. NO biased framing left or right.
-   - **No cropping**: Do NOT crop hair, forehead, chin, jawline, neck, or shoulders.
-   - Both shoulders fully inside the frame with a small symmetric margin on each side.
-   - Subject occupies roughly 50-60% of frame width.
-
-Output a single LANDSCAPE image at a 3:2 aspect ratio (wider than tall) at the highest possible quality and resolution. The full head and both shoulders MUST fit within this landscape frame with visible gradient background on left and right sides. The final image must look like it was taken by a professional photographer with a high-end camera — not generated by AI."""
+Output one bright, polished landscape headshot at 3:2."""
 
     if custom_prompt:
         prompt_text += f"""
 
-10. **User intent tags/prompts**: Incorporate these preferences where reasonable:
-{custom_prompt}
-"""
+User preferences to incorporate where they fit naturally:
+{custom_prompt}"""
 
     if improvement_feedback:
         prompt_text += f"""
 
-IMPORTANT — The previous generation was rejected. Here is the feedback on what to fix:
-{improvement_feedback}
-
-Please regenerate the image addressing ALL of the above issues while keeping all the original requirements."""
+Notes from a previous attempt — please address these in this version:
+{improvement_feedback}"""
 
     contents.append(prompt_text)
 
