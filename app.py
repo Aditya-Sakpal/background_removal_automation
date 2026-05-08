@@ -32,6 +32,7 @@ MIN_IMAGES = 2
 MAX_IMAGES = 3
 MAX_RETRY = 3
 STYLE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "1768222411704.jpg")
+HEAD_SPACE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "head_space_reference.png")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
 PROFILE_MAX_SIZE_KB = 50
@@ -652,7 +653,18 @@ def generate_linkedin_image(
         "uniform background as described below."
     )
 
-    # 2. User's input photos
+    # 2. Head-space / framing reference — shows the EXACT headroom we want
+    head_space_ref = Image.open(HEAD_SPACE_REFERENCE_PATH).convert("RGB")
+    contents.append(head_space_ref)
+    contents.append(
+        "The second image is a HEAD-SPACE / FRAMING REFERENCE. Look at how much empty "
+        "background sits ABOVE the subject's head — the top of the hair is well below "
+        "the top edge of the frame, with a generous band of background above. Match "
+        "this exact headroom proportion in your output. Do NOT copy this person, their "
+        "background, their clothing, or any overlay text — copy ONLY the framing/headroom."
+    )
+
+    # 3. User's input photos
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
@@ -661,8 +673,15 @@ def generate_linkedin_image(
         "person's appearance — facial features, skin tone, hair, and clothing."
     )
 
-    # 3. Generation prompt — short, conversational, no trigger words
+    # 4. Generation prompt — short, conversational, no trigger words
     prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos.
+
+TOP PRIORITY — HEADROOM (most important rule, do not violate):
+- There MUST be a large, obvious band of empty background ABOVE the top of the hair.
+- The top of the hair must sit roughly 25-30% of the way DOWN from the top edge of the frame. The upper ~25-30% of the image is pure background, with NO part of the subject in it.
+- Match the headroom shown in the head-space reference image (image #2 above) — that much space above the head, or more.
+- The eyes should sit at or slightly BELOW the horizontal midline of the frame, NOT in the upper third. This pushes the head down and forces visible space above it.
+- FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head. If the top of the hair is anywhere in the upper 20% of the frame, the image is WRONG.
 
 Style notes:
 - A polished, photorealistic portrait with a warm, confident expression and a slight smile.
@@ -676,13 +695,13 @@ Background:
 - A very subtle soft highlight near the upper-centre is fine.
 - Avoid a dark vignette or heavy radial falloff. The corners should be roughly the same tone as the rest of the background.
 
-Composition (rule of thirds, landscape 3:2):
-- Imagine the frame divided into a 3×3 grid.
-- The top of the hair sits just below the upper-third horizontal line, so the top third of the frame is empty background above the hair.
-- The face fits within the middle band of the frame, taking around 30-40% of the frame's vertical height.
+Composition (landscape 3:2):
+- The face takes around 25-35% of the frame's vertical height (smaller than you might default to — this is what creates the headroom).
 - The subject is centred horizontally — equal background on left and right.
 - Both shoulders are fully visible with a small margin, and the collar/neckline of the clothing is visible at the bottom.
 - A slightly angled pose works well; avoid a straight-on stare.
+
+Self-check before finishing: cover the lower half of your output with your hand — the upper half should show clear background above the head, with the head sitting mostly in the lower half of the frame. If the head dominates the upper half, regenerate with the camera pulled back further.
 
 Output one bright, polished landscape headshot at 3:2."""
 
