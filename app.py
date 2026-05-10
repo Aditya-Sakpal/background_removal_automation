@@ -34,6 +34,7 @@ MAX_RETRY = 3
 STYLE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "1768222411704.jpg")
 HEAD_SPACE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "head_space_reference.png")
 GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "gradient_reference.jpg")
+COMPOSITION_GOLD_STANDARD_PATH = os.path.join(os.path.dirname(__file__), "netanyahu's image.jpg")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
 PROFILE_MAX_SIZE_KB = 50
@@ -644,40 +645,56 @@ def generate_linkedin_image(
 
     contents: list = []
 
-    # 1. Style reference image first
+    # 1. GOLD STANDARD composition reference — the client-approved benchmark.
+    #    This single image is the dominant guide for headroom + black bottom gradient + centering.
+    gold_standard_ref = Image.open(COMPOSITION_GOLD_STANDARD_PATH).convert("RGB")
+    contents.append(gold_standard_ref)
+    contents.append(
+        "The first image is the GOLD STANDARD COMPOSITION REFERENCE — this is exactly "
+        "what the client wants the final output to look like in terms of composition. "
+        "Do NOT copy the person, their clothing, the suit, the tie, the pin, or the "
+        "background hue. Copy ONLY the composition pattern, which has THREE features "
+        "you MUST replicate:\n"
+        "  (a) HEADROOM — there is a generous band of empty background above the top "
+        "of the hair, occupying roughly the upper 20-25% of the frame.\n"
+        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep black "
+        "band along the bottom edge of the frame, AND this black band extends UPWARD "
+        "into the lower portion of the subject's clothing so the bottom of the jacket "
+        "blends into the darkness with no sharp visible edge. The subject appears to "
+        "merge into black at the bottom — there is no hard boundary between the "
+        "subject's lower clothing and the frame bottom.\n"
+        "  (c) HORIZONTAL CENTRING — the subject sits roughly centred with similar "
+        "amounts of background on the left and the right."
+    )
+
+    # 2. Style reference image
     style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
     contents.append(style_ref)
     contents.append(
-        "The first image is a style reference for cohesive, polished portrait look. "
+        "The second image is a style reference for cohesive, polished portrait look. "
         "Use it for inspiration on lighting and how the subject sits naturally in the "
-        "frame. Ignore its dark mood and vignette — the output should have a bright, "
-        "uniform background as described below."
+        "frame. Ignore its dark mood and vignette — the background should follow the "
+        "gold-standard pattern (clean colour at top → black at bottom)."
     )
 
-    # 2. Head-space / framing reference — shows the EXACT headroom we want
+    # 3. Head-space / framing reference — reinforces the headroom rule
     head_space_ref = Image.open(HEAD_SPACE_REFERENCE_PATH).convert("RGB")
     contents.append(head_space_ref)
     contents.append(
-        "The second image is a HEAD-SPACE / FRAMING REFERENCE. Look at how much empty "
-        "background sits ABOVE the subject's head — the top of the hair is well below "
-        "the top edge of the frame, with a generous band of background above. Match "
-        "this exact headroom proportion in your output. Do NOT copy this person, their "
-        "background, their clothing, or any overlay text — copy ONLY the framing/headroom."
+        "The third image reinforces the HEAD-SPACE rule from the gold standard. Match "
+        "this much (or more) empty background above the head. Do NOT copy the person."
     )
 
-    # 3. Gradient reference — shows the black-bottom gradient we want
+    # 4. Gradient reference — reinforces the black-bottom gradient rule
     gradient_ref = Image.open(GRADIENT_REFERENCE_PATH).convert("RGB")
     contents.append(gradient_ref)
     contents.append(
-        "The third image is a BACKGROUND GRADIENT REFERENCE. Notice how the background "
-        "transitions smoothly from the chosen colour at the top into a deep black band "
-        "across the bottom of the frame. Replicate this top-to-bottom gradient in your "
-        "output: a clean colour at the top, fading smoothly to BLACK at the bottom. Do "
-        "NOT copy this person, their clothing, or the orange hue — copy ONLY the "
-        "vertical gradient pattern (top colour → black at bottom)."
+        "The fourth image reinforces the BLACK BOTTOM GRADIENT rule from the gold "
+        "standard. Match the top-colour-to-black vertical fade. Do NOT copy the "
+        "person or the orange hue."
     )
 
-    # 4. User's input photos
+    # 5. User's input photos
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
@@ -686,13 +703,13 @@ def generate_linkedin_image(
         "person's appearance — facial features, skin tone, hair, and clothing."
     )
 
-    # 4. Generation prompt — short, conversational, no trigger words
-    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos.
+    # 6. Generation prompt — short, conversational, no trigger words
+    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos. The composition (headroom, black bottom gradient, centring) must match the gold-standard reference (first image provided).
 
 TOP PRIORITY — HEADROOM (most important rule, do not violate):
 - There MUST be a large, obvious band of empty background ABOVE the top of the hair.
 - The top of the hair must sit roughly 25-30% of the way DOWN from the top edge of the frame. The upper ~25-30% of the image is pure background, with NO part of the subject in it.
-- Match the headroom shown in the head-space reference image (image #2 above) — that much space above the head, or more.
+- Match the headroom shown in the gold-standard reference (first image) — that much space above the head, or more.
 - The eyes should sit at or slightly BELOW the horizontal midline of the frame, NOT in the upper third. This pushes the head down and forces visible space above it.
 - FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head. If the top of the hair is anywhere in the upper 20% of the frame, the image is WRONG.
 
@@ -939,9 +956,10 @@ If none of the three rejection conditions apply, return is_approved=true and thi
 # ---------------------------------------------------------------------------
 def linkedin_composition_guardrail(generated_image: bytes) -> dict:
     """
-    Strictly checks the generated LinkedIn headshot against three composition rules:
-      1. Black gradient at the bottom (matching the gradient reference image).
-      2. Significant headroom above the subject's head (matching the head-space reference).
+    Strictly checks the generated LinkedIn headshot against three composition rules,
+    using the Netanyahu image as the client-approved gold-standard reference:
+      1. Black gradient at the bottom that ALSO blends into the lower portion of the subject.
+      2. Significant headroom above the subject's head.
       3. Subject is horizontally centered in the frame.
 
     Returns {"is_approved": bool, "things_to_improve": str | False}.
@@ -950,23 +968,16 @@ def linkedin_composition_guardrail(generated_image: bytes) -> dict:
     """
     client = get_openai_client()
 
-    with open(GRADIENT_REFERENCE_PATH, "rb") as f:
-        gradient_ref_bytes = f.read()
-    with open(HEAD_SPACE_REFERENCE_PATH, "rb") as f:
-        head_space_ref_bytes = f.read()
+    with open(COMPOSITION_GOLD_STANDARD_PATH, "rb") as f:
+        gold_standard_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- GRADIENT REFERENCE (background must fade to BLACK at the bottom like this) ---"},
+        {"type": "text", "text": "--- GOLD-STANDARD COMPOSITION REFERENCE (client-approved benchmark) ---"},
         {
             "type": "image_url",
-            "image_url": {"url": encode_image_for_openai(gradient_ref_bytes, "image/jpeg"), "detail": "high"},
+            "image_url": {"url": encode_image_for_openai(gold_standard_bytes, "image/jpeg"), "detail": "high"},
         },
-        {"type": "text", "text": "--- HEAD-SPACE REFERENCE (this much empty background above the head, or more) ---"},
-        {
-            "type": "image_url",
-            "image_url": {"url": encode_image_for_openai(head_space_ref_bytes, "image/png"), "detail": "high"},
-        },
-        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate against the gold standard) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
@@ -975,30 +986,32 @@ def linkedin_composition_guardrail(generated_image: bytes) -> dict:
 
     prompt = """You are a STRICT composition reviewer for AI-generated LinkedIn profile headshots.
 
-You are given THREE images:
-1. A gradient reference (showing the desired bottom-of-frame black gradient).
-2. A head-space reference (showing the desired amount of empty background above the head).
-3. The generated LinkedIn image to evaluate.
+You are given TWO images:
+1. A GOLD-STANDARD COMPOSITION REFERENCE — the client-approved benchmark for what an acceptable LinkedIn headshot looks like. Use it as the visual benchmark for all three checks below. Do NOT evaluate the person, clothing, colour palette, or background hue — evaluate ONLY the composition pattern.
+2. The generated LinkedIn image to evaluate.
 
 You MUST evaluate the generated image against ONLY these three rules. Do not invent additional criteria. Do not flag face quality, clothing, lighting style, or anything not listed.
 
-RULES:
+RULES (each anchored to the gold-standard reference):
 
-1. **Black gradient at the bottom**: The background of the generated image must transition from a colour at the top to a clearly visible BLACK band along the bottom of the frame, similar to the gradient reference. The bottom ~25-40% of the background should noticeably darken into black. PASS if there is an obvious dark/black gradient at the bottom. FAIL if the background is a flat single colour with no dark bottom band, or only has a vignette in the corners, or fades to a non-black colour.
+1. **Headroom above the subject's head** — Look at the gap between the top of the hair and the top edge of the gold-standard reference: there is a clearly visible band of empty background occupying roughly the upper 20-25% of the image. The generated image must show a comparable amount of empty background above the head. PASS if the empty band above the hair takes at least ~15% of the frame's vertical height. FAIL if the hair touches or nearly touches the top edge, the hair sits in the top 10% of the frame, or there is noticeably less headroom than the reference.
 
-2. **Significant headroom above the subject's head**: There must be a clear, generous band of empty background ABOVE the top of the subject's hair, comparable to the head-space reference. The top of the hair should sit roughly in the upper third of the frame (around 20-30% down from the top edge) — NOT pressed against the top of the frame. PASS if there is a clearly visible empty band of background above the head taking at least ~15% of the frame's vertical height. FAIL if the head is near the top of the frame, the hair touches or nearly touches the top edge, or there is little to no breathing room above the head.
+2. **Black bottom gradient that blends into the subject** — Look at the bottom of the gold-standard reference. Two things are true and BOTH must be matched in the generated image:
+   (a) The background fades into a deep BLACK band along the bottom edge of the frame.
+   (b) That black band extends UPWARD into the lower portion of the subject — the bottom of the jacket/shirt is partially absorbed into the darkness, with NO sharp visible edge between the subject's clothing and the bottom of the frame. The subject appears to merge into the black at the bottom.
+   PASS only if BOTH (a) and (b) are clearly present. FAIL if the background is a flat colour with no dark bottom band, OR if there is only a corner vignette, OR if the bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
 
-3. **Horizontal centering**: The subject (head and shoulders) must be horizontally centered in the frame, with roughly equal background space on the left and right of the person. PASS if the subject is centered or only very slightly off-center. FAIL if the subject is clearly shifted to the left or right side of the frame.
+3. **Horizontal centring** — In the gold-standard reference, the subject sits roughly centred with similar amounts of background on the left and the right (slight off-centre is acceptable). PASS if the generated subject is centred or only very slightly off-centre. FAIL if the subject is clearly shifted to the left or right side of the frame.
 
 For each FAILED rule, write a SHORT, SPECIFIC, ACTIONABLE instruction (one sentence each) that can be fed directly back to the image generator to fix the issue on the next attempt. Examples:
-- "Add a smooth black gradient across the bottom 30% of the background — the current background is a flat colour with no dark bottom band."
-- "Move the subject DOWN in the frame so the top of the hair sits in the upper third with at least 20% empty background above it — currently the head is pressed against the top edge."
+- "Move the subject DOWN in the frame so the top of the hair sits 20-25% down from the top edge, matching the gold-standard reference — currently the head is pressed against the top edge."
+- "Add a smooth black gradient across the bottom of the background AND let it extend upward into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black, matching the gold-standard reference — currently the background is a flat colour and the subject's lower edge is fully visible."
 - "Recenter the subject horizontally — the person is currently shifted to the left/right of the frame."
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
-    "gradient_pass": true or false,
     "headroom_pass": true or false,
+    "gradient_pass": true or false,
     "centering_pass": true or false,
     "is_approved": true or false,
     "things_to_improve": false or "concatenated actionable fix instructions for every failed rule"
