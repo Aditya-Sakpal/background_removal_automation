@@ -35,6 +35,7 @@ STYLE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "1768222411704.jp
 HEAD_SPACE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "head_space_reference.png")
 GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "gradient_reference.jpg")
 COMPOSITION_GOLD_STANDARD_PATH = os.path.join(os.path.dirname(__file__), "netanyahu's image.jpg")
+VIGNETTE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "zakir-khan_Comedian.png")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
 PROFILE_MAX_SIZE_KB = 50
@@ -645,8 +646,7 @@ def generate_linkedin_image(
 
     contents: list = []
 
-    # 1. GOLD STANDARD composition reference — the client-approved benchmark.
-    #    This single image is the dominant guide for headroom + black bottom gradient + centering.
+    # 1. GOLD STANDARD composition reference (Netanyahu) — black bottom gradient anchor.
     gold_standard_ref = Image.open(COMPOSITION_GOLD_STANDARD_PATH).convert("RGB")
     contents.append(gold_standard_ref)
     contents.append(
@@ -667,34 +667,55 @@ def generate_linkedin_image(
         "amounts of background on the left and the right."
     )
 
-    # 2. Style reference image
+    # 2. VIGNETTE reference (Zakir Khan) — anchors radial vignette + headroom + centring.
+    vignette_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
+    contents.append(vignette_ref)
+    contents.append(
+        "The second image is the VIGNETTE COMPOSITION REFERENCE. Do NOT copy the "
+        "person, the maroon/red hue, the microphone, the blazer, or the clothing. "
+        "Copy ONLY these three composition features:\n"
+        "  (a) RADIAL VIGNETTE — there is a clear radial darkening from a brighter, "
+        "softly-lit region behind/around the subject's head fading into noticeably "
+        "darker corners and edges. The corners of the frame are distinctly darker "
+        "than the area immediately behind the subject's head. This is a SOFT, smooth "
+        "radial fade — not a hard mask, not a black border, not a vignette so heavy "
+        "that the subject is silhouetted.\n"
+        "  (b) HEADROOM — match the empty background above the top of the hair: "
+        "roughly the upper 20-25% of the frame is empty background, the hair does "
+        "NOT touch the top edge.\n"
+        "  (c) HORIZONTAL CENTRING — the subject's head and shoulders sit roughly "
+        "centred horizontally with similar amounts of background on the left and "
+        "the right of the person."
+    )
+
+    # 3. Style reference image
     style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
     contents.append(style_ref)
     contents.append(
-        "The second image is a style reference for cohesive, polished portrait look. "
+        "The third image is a style reference for cohesive, polished portrait look. "
         "Use it for inspiration on lighting and how the subject sits naturally in the "
-        "frame. Ignore its dark mood and vignette — the background should follow the "
-        "gold-standard pattern (clean colour at top → black at bottom)."
+        "frame. The final background should combine the gold-standard pattern (clean "
+        "colour at top → black at bottom) with the vignette reference's radial "
+        "darkening at the corners and edges."
     )
 
-    # 3. Head-space / framing reference — reinforces the headroom rule
+    # 4. Head-space / framing reference — reinforces the headroom rule
     head_space_ref = Image.open(HEAD_SPACE_REFERENCE_PATH).convert("RGB")
     contents.append(head_space_ref)
     contents.append(
-        "The third image reinforces the HEAD-SPACE rule from the gold standard. Match "
-        "this much (or more) empty background above the head. Do NOT copy the person."
+        "The fourth image reinforces the HEAD-SPACE rule. Match this much (or more) "
+        "empty background above the head. Do NOT copy the person."
     )
 
-    # 4. Gradient reference — reinforces the black-bottom gradient rule
+    # 5. Gradient reference — reinforces the black-bottom gradient rule
     gradient_ref = Image.open(GRADIENT_REFERENCE_PATH).convert("RGB")
     contents.append(gradient_ref)
     contents.append(
-        "The fourth image reinforces the BLACK BOTTOM GRADIENT rule from the gold "
-        "standard. Match the top-colour-to-black vertical fade. Do NOT copy the "
-        "person or the orange hue."
+        "The fifth image reinforces the BLACK BOTTOM GRADIENT rule. Match the "
+        "top-colour-to-black vertical fade. Do NOT copy the person or the orange hue."
     )
 
-    # 5. User's input photos
+    # 6. User's input photos
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
@@ -703,8 +724,8 @@ def generate_linkedin_image(
         "person's appearance — facial features, skin tone, hair, and clothing."
     )
 
-    # 6. Generation prompt — short, conversational, no trigger words
-    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos. The composition (headroom, black bottom gradient, centring) must match the gold-standard reference (first image provided).
+    # 7. Generation prompt — short, conversational, no trigger words
+    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the gold-standard reference (first image) and the vignette reference (second image).
 
 TOP PRIORITY — HEADROOM (most important rule, do not violate):
 - There MUST be a large, obvious band of empty background ABOVE the top of the hair.
@@ -720,12 +741,12 @@ Style notes:
 - Render natural skin texture (subtle pores, fine details) — avoid an airbrushed or plastic look.
 - Hair rendered with natural strands and volume, not a flat mass.
 
-Background — vertical gradient (match the gradient reference image #3):
+Background — vertical gradient + radial vignette (match gold-standard reference for the bottom gradient AND the vignette reference for the radial darkening):
 - The TOP portion of the background is a clean, vivid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
-- The background then transitions smoothly DOWNWARD into a rich, deep BLACK band across the bottom of the frame. The lower ~30-40% of the background should fade into black.
-- The transition between the top colour and the black bottom must be a smooth vertical gradient — no hard line, no banding.
-- Sides/corners follow the same vertical gradient (top = colour, bottom = black). This is a top-to-bottom gradient, not a radial vignette.
-- A subtle soft highlight near the upper-centre is fine.
+- The background transitions smoothly DOWNWARD into a rich, deep BLACK band across the bottom of the frame. The lower ~30-40% of the background fades into black, and this black band extends UPWARD into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black with no hard visible edge.
+- ON TOP OF the vertical gradient, apply a SOFT RADIAL VIGNETTE: the area immediately behind and around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker. The vignette is smooth and subtle — no hard mask, no heavy black border, the subject is never silhouetted.
+- The transitions (both vertical gradient and radial vignette) must be smooth — no banding, no hard lines.
+- Net effect: the corners are dark, the bottom is darker still (fading into the subject's lower clothing), and the area behind the head has a softly-lit "halo" that draws the eye to the face.
 
 Composition (landscape 3:2):
 - The face takes around 25-35% of the frame's vertical height (smaller than you might default to — this is what creates the headroom).
@@ -956,11 +977,12 @@ If none of the three rejection conditions apply, return is_approved=true and thi
 # ---------------------------------------------------------------------------
 def linkedin_composition_guardrail(generated_image: bytes) -> dict:
     """
-    Strictly checks the generated LinkedIn headshot against three composition rules,
-    using the Netanyahu image as the client-approved gold-standard reference:
-      1. Black gradient at the bottom that ALSO blends into the lower portion of the subject.
-      2. Significant headroom above the subject's head.
-      3. Subject is horizontally centered in the frame.
+    Strictly checks the generated LinkedIn headshot against FOUR composition rules,
+    using two client-approved reference images:
+      1. Headroom — anchored to the VIGNETTE reference (Zakir Khan).
+      2. Black bottom gradient that blends into the subject — anchored to the GOLD STANDARD (Netanyahu).
+      3. Horizontal centring — anchored to the VIGNETTE reference (Zakir Khan).
+      4. Soft radial vignette darkening corners — anchored to the VIGNETTE reference (Zakir Khan).
 
     Returns {"is_approved": bool, "things_to_improve": str | False}.
     On failure, things_to_improve contains an actionable, prompt-ready description
@@ -970,14 +992,21 @@ def linkedin_composition_guardrail(generated_image: bytes) -> dict:
 
     with open(COMPOSITION_GOLD_STANDARD_PATH, "rb") as f:
         gold_standard_bytes = f.read()
+    with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
+        vignette_ref_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- GOLD-STANDARD COMPOSITION REFERENCE (client-approved benchmark) ---"},
+        {"type": "text", "text": "--- GOLD-STANDARD REFERENCE (anchor for the BLACK BOTTOM GRADIENT rule) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(gold_standard_bytes, "image/jpeg"), "detail": "high"},
         },
-        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate against the gold standard) ---"},
+        {"type": "text", "text": "--- VIGNETTE REFERENCE (anchor for the HEADROOM, CENTRING, and VIGNETTE rules) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(vignette_ref_bytes, "image/png"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
@@ -986,38 +1015,43 @@ def linkedin_composition_guardrail(generated_image: bytes) -> dict:
 
     prompt = """You are a STRICT composition reviewer for AI-generated LinkedIn profile headshots.
 
-You are given TWO images:
-1. A GOLD-STANDARD COMPOSITION REFERENCE — the client-approved benchmark for what an acceptable LinkedIn headshot looks like. Use it as the visual benchmark for all three checks below. Do NOT evaluate the person, clothing, colour palette, or background hue — evaluate ONLY the composition pattern.
-2. The generated LinkedIn image to evaluate.
+You are given THREE images:
+1. GOLD-STANDARD REFERENCE — anchors the BLACK BOTTOM GRADIENT rule.
+2. VIGNETTE REFERENCE — anchors the HEADROOM, HORIZONTAL CENTRING, and RADIAL VIGNETTE rules.
+3. The generated LinkedIn image to evaluate.
 
-You MUST evaluate the generated image against ONLY these three rules. Do not invent additional criteria. Do not flag face quality, clothing, lighting style, or anything not listed.
+You MUST evaluate the generated image against ONLY the four rules below. Do not invent additional criteria. Do not evaluate the person, clothing, colour palette, or background hue — evaluate ONLY the composition pattern. Do not flag face quality, lighting style, accessories, or anything not listed.
 
-RULES (each anchored to the gold-standard reference):
+RULES:
 
-1. **Headroom above the subject's head** — Look at the gap between the top of the hair and the top edge of the gold-standard reference: there is a clearly visible band of empty background occupying roughly the upper 20-25% of the image. The generated image must show a comparable amount of empty background above the head. PASS if the empty band above the hair takes at least ~15% of the frame's vertical height. FAIL if the hair touches or nearly touches the top edge, the hair sits in the top 10% of the frame, or there is noticeably less headroom than the reference.
+1. **Headroom above the subject's head** (anchor: VIGNETTE reference) — Look at the gap between the top of the hair and the top edge of the vignette reference: there is a clearly visible band of empty background occupying roughly the upper 20-25% of the frame. The generated image must show a comparable amount of empty background above the head. PASS if the empty band above the hair takes at least ~15% of the frame's vertical height. FAIL if the hair touches or nearly touches the top edge, the hair sits in the top 10% of the frame, or there is noticeably less headroom than the vignette reference.
 
-2. **Black bottom gradient that blends into the subject** — Look at the bottom of the gold-standard reference. Two things are true and BOTH must be matched in the generated image:
+2. **Black bottom gradient that blends into the subject** (anchor: GOLD-STANDARD reference) — Look at the bottom of the gold-standard reference. Two things are true and BOTH must be matched in the generated image:
    (a) The background fades into a deep BLACK band along the bottom edge of the frame.
    (b) That black band extends UPWARD into the lower portion of the subject — the bottom of the jacket/shirt is partially absorbed into the darkness, with NO sharp visible edge between the subject's clothing and the bottom of the frame. The subject appears to merge into the black at the bottom.
-   PASS only if BOTH (a) and (b) are clearly present. FAIL if the background is a flat colour with no dark bottom band, OR if there is only a corner vignette, OR if the bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
+   PASS only if BOTH (a) and (b) are clearly present. FAIL if the background is a flat colour with no dark bottom band, OR if only a corner vignette is present without a dark bottom band, OR if the bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
 
-3. **Horizontal centring** — In the gold-standard reference, the subject sits roughly centred with similar amounts of background on the left and the right (slight off-centre is acceptable). PASS if the generated subject is centred or only very slightly off-centre. FAIL if the subject is clearly shifted to the left or right side of the frame.
+3. **Horizontal centring** (anchor: VIGNETTE reference) — In the vignette reference, the subject sits roughly centred with similar amounts of background on the left and the right (slight off-centre is acceptable). PASS if the generated subject is centred or only very slightly off-centre. FAIL if the subject is clearly shifted to the left or right side of the frame.
+
+4. **Soft radial vignette** (anchor: VIGNETTE reference) — Look at the vignette reference: the area immediately behind/around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker — a clear, smooth radial darkening from the centre outward. The generated image must show this same effect. PASS if the corners of the frame are clearly darker than the area directly behind the subject's head, with a smooth fade (no banding). FAIL if the background is a flat colour from edge to edge with no radial darkening, OR if the corners are the same brightness as the centre, OR if the vignette is so heavy/hard that the subject is silhouetted or a black border is visible.
 
 For each FAILED rule, write a SHORT, SPECIFIC, ACTIONABLE instruction (one sentence each) that can be fed directly back to the image generator to fix the issue on the next attempt. Examples:
-- "Move the subject DOWN in the frame so the top of the hair sits 20-25% down from the top edge, matching the gold-standard reference — currently the head is pressed against the top edge."
+- "Move the subject DOWN in the frame so the top of the hair sits 20-25% down from the top edge, matching the vignette reference — currently the head is pressed against the top edge."
 - "Add a smooth black gradient across the bottom of the background AND let it extend upward into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black, matching the gold-standard reference — currently the background is a flat colour and the subject's lower edge is fully visible."
 - "Recenter the subject horizontally — the person is currently shifted to the left/right of the frame."
+- "Apply a soft radial vignette so the corners are clearly darker than the area behind the subject's head, matching the vignette reference — currently the background brightness is uniform from edge to edge."
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
     "headroom_pass": true or false,
     "gradient_pass": true or false,
     "centering_pass": true or false,
+    "vignette_pass": true or false,
     "is_approved": true or false,
     "things_to_improve": false or "concatenated actionable fix instructions for every failed rule"
 }
 
-is_approved is true ONLY if ALL THREE rules pass. If any rule fails, is_approved is false and things_to_improve is the concatenated instructions for the failed rules."""
+is_approved is true ONLY if ALL FOUR rules pass. If any rule fails, is_approved is false and things_to_improve is the concatenated instructions for the failed rules."""
 
     response = client.chat.completions.create(
         model="gpt-4o",
@@ -1383,7 +1417,13 @@ if uploaded_files:
     cols = st.columns(min(len(uploaded_files), MAX_IMAGES))
     for i, f in enumerate(uploaded_files):
         with cols[i % len(cols)]:
-            st.image(f, caption=f.name, use_container_width=True)
+            try:
+                f.seek(0)
+                img_bytes = f.read()
+                f.seek(0)
+                st.image(img_bytes, caption=f.name, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Cannot preview {f.name}: {e}")
 
 if st.button("Generate Image", type="primary", use_container_width=True):
     st.session_state.result_data = None
