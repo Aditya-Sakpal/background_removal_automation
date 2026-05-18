@@ -707,44 +707,78 @@ def generate_linkedin_image(
 
     contents: list = []
 
-    # 1. CANONICAL composition reference (Zakir Khan) — the single source of truth
-    #    for all four composition rules: headroom (subject size), black bottom
-    #    gradient blending into the clothing, horizontal centring, and radial vignette.
-    composition_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
-    contents.append(composition_ref)
-    contents.append(
-        "The first image is the CANONICAL COMPOSITION REFERENCE. Replicate its "
-        "composition exactly. Do NOT copy the person, the maroon/red background hue, "
-        "the microphone, the blazer, or any clothing. Copy ONLY the composition pattern, "
-        "which has FOUR features you must match:\n"
-        "  (a) SUBJECT SIZE / HEADROOM — notice how small the subject is relative to "
-        "the frame: there is a generous band of empty background above the top of the "
-        "hair, occupying roughly the upper 20-25% of the frame. The subject is framed "
-        "from a wider distance — the head and shoulders take only the lower portion "
-        "of the image, never filling it from edge to edge.\n"
-        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep dark "
-        "band along the bottom edge of the frame, and that dark band extends UPWARD "
-        "into the lower portion of the subject's clothing so the bottom of the jacket "
-        "dissolves into darkness with no sharp visible edge.\n"
-        "  (c) HORIZONTAL CENTRING — the subject sits roughly centred with similar "
-        "amounts of background on the left and the right.\n"
-        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around the head is "
-        "the brightest part of the background; the corners and edges are noticeably "
-        "darker in a smooth radial fade (no hard mask, no heavy border)."
-    )
-
-    # 2. User's input photos
+    # 1. SUBJECT PHOTOS FIRST — these are the identity anchor. Putting them first
+    #    in the contents list gives them more weight in Gemini's multi-image
+    #    attention, which reduces the chance of the composition reference's
+    #    person bleeding into the output.
+    subject_count = len(images)
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
     contents.append(
-        "The remaining images are the subject photos. Use them only for the person's "
-        "appearance — facial features, skin tone, hair, and clothing. For composition "
-        "and background, follow the canonical composition reference (first image)."
+        f"The first {subject_count} image(s) above are the SUBJECT photos. They define "
+        "the IDENTITY of the person who must appear in the output:\n"
+        "  • Same face — same facial structure, same skin tone, same nose, same lips, "
+        "    same eyes, same eyebrows, same jawline.\n"
+        "  • Same hair — same hair style, same hair colour, same hairline.\n"
+        "  • Same facial hair (beard, moustache, stubble) — same shape, length, density.\n"
+        "  • Same age, gender, and ethnicity.\n"
+        "  • Same clothing — same colour, same style, same neckline, same fabric.\n"
+        "The person rendered in the output MUST be this person. Not a different "
+        "person who looks similar. Not a blend of this person with anyone else. "
+        "The exact same individual shown in these subject photos."
     )
 
-    # 7. Generation prompt — short, conversational, no trigger words
-    prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the gold-standard reference (first image) and the vignette reference (second image).
+    # 2. CANONICAL COMPOSITION reference (Zakir Khan) — appears AFTER the subject
+    #    photos so it doesn't dominate the identity signal. Used ONLY for the
+    #    four composition rules; the person, clothing, and colour palette in
+    #    this reference must be ignored.
+    composition_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
+    contents.append(composition_ref)
+    contents.append(
+        "The LAST image above is the CANONICAL COMPOSITION REFERENCE. It exists "
+        "ONLY to show you the COMPOSITION PATTERN — framing, headroom, gradient, "
+        "and vignette. Read this carefully:\n"
+        "\n"
+        "  ⚠ THE PERSON IN THIS REFERENCE IS NOT THE SUBJECT. ⚠\n"
+        "\n"
+        "Treat this reference as if the person inside it were invisible — you are "
+        "looking at it purely for the LAYOUT (where the head sits in the frame, "
+        "how the background fades into the clothing, how the corners are darker, "
+        "where the subject is positioned horizontally). The IDENTITY of the person "
+        "in the output comes ONLY from the SUBJECT PHOTOS above.\n"
+        "\n"
+        "Specifically, the FOUR composition features you must replicate from this "
+        "reference are:\n"
+        "  (a) SUBJECT SIZE / HEADROOM — notice how small the subject is relative "
+        "to the frame: a generous band of empty background sits above the top of "
+        "the hair, occupying roughly the upper 20-25% of the frame. The subject is "
+        "framed from a wider distance — head and shoulders take only the lower "
+        "portion of the image, never filling it from edge to edge.\n"
+        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep "
+        "dark band along the bottom edge, and that dark band extends UPWARD into "
+        "the lower portion of the subject's clothing so the bottom of the jacket "
+        "dissolves into darkness with no sharp visible edge.\n"
+        "  (c) HORIZONTAL CENTRING — the subject sits roughly centred with similar "
+        "amounts of background on the left and the right.\n"
+        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around the head "
+        "is the brightest part of the background; the corners and edges are "
+        "noticeably darker in a smooth radial fade (no hard mask, no heavy border).\n"
+        "\n"
+        "FORBIDDEN: copying the person from this reference, copying their face, "
+        "facial hair, hair style, ethnicity, age, gender, expression, pose, "
+        "clothing colour, blazer, microphone, or background hue. None of these "
+        "elements from this reference should appear in the output."
+    )
+
+    # 3. Generation prompt — composition rules + explicit identity anchor.
+    prompt_text = """Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the canonical composition reference (last image).
+
+IDENTITY (read this first — most common failure mode):
+- The face, skin tone, hair, facial hair, ethnicity, age, gender, and overall identity in the output MUST come from the SUBJECT PHOTOS — the first images in the input. NOT from the composition reference.
+- The composition reference (last image) shows a DIFFERENT PERSON who is NOT the subject. Their face, expression, blazer, microphone, and ethnicity are decoys — look past them.
+- If you find yourself producing an output that looks more like the person in the composition reference than the person in the subject photos, you have made a mistake. Start over.
+- One sanity check: would the person in the subject photos recognise themselves in your output? If not, the identity is wrong.
 
 TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING (most important rule):
 - Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame. The subject's head + shoulders should occupy only the LOWER PORTION of the image, NOT fill the entire frame from top to bottom.
@@ -761,7 +795,7 @@ Style notes:
 - Render natural skin texture (subtle pores, fine details) — avoid an airbrushed or plastic look.
 - Hair rendered with natural strands and volume, not a flat mass.
 
-Background — vertical gradient + radial vignette (match gold-standard reference for the bottom gradient AND the vignette reference for the radial darkening):
+Background — vertical gradient + radial vignette (match the canonical reference for the bottom gradient AND the radial darkening):
 - The TOP portion of the background is a clean, vivid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
 - The background transitions smoothly DOWNWARD into a rich, deep BLACK band across the bottom of the frame. The lower ~30-40% of the background fades into black, and this black band extends UPWARD into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black with no hard visible edge.
 - ON TOP OF the vertical gradient, apply a SOFT RADIAL VIGNETTE: the area immediately behind and around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker. The vignette is smooth and subtle — no hard mask, no heavy black border, the subject is never silhouetted.
