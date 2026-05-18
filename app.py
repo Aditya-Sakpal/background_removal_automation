@@ -1669,6 +1669,19 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         feedback = result.get("things_to_improve") if not passed else None
         return passed, feedback if isinstance(feedback, str) else None
 
+    def _show_debug_image(label: str, image_bytes: bytes) -> None:
+        """Render an image inline with its dimensions for debugging."""
+        try:
+            pil = Image.open(io.BytesIO(image_bytes))
+            w, h = pil.size
+            st.image(
+                pil,
+                caption=f"{label} — {w}×{h}px",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.write(f"_(could not render {label}: {e})_")
+
     def _run_stage(stage_name: str, guardrail_fn, current_image: bytes) -> bytes:
         """
         Run one composition stage with up to MAX_RETRY regenerations.
@@ -1679,10 +1692,12 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         """
         image = current_image
         for retry in range(1, MAX_RETRY + 1):
+            st.markdown(f"**{stage_name} — check {retry}/{MAX_RETRY}**")
+            _show_debug_image(f"{stage_name} attempt {retry}", image)
             passed, feedback = _run_single_guardrail(stage_name, guardrail_fn, image)
+            verdict = "✅ PASS" if passed else "❌ FAIL"
             st.write(
-                f"  • {stage_name} guardrail (check {retry}/{MAX_RETRY}): "
-                f"{'PASS' if passed else 'FAIL'}"
+                f"  • {stage_name} guardrail verdict: {verdict}"
                 + (f" — {feedback}" if feedback else "")
             )
             if passed:
@@ -1695,6 +1710,8 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 return image
             # Regenerate with this stage's specific feedback for the next check.
             stage_feedback = feedback or f"{stage_name} composition rule failed."
+            with st.expander(f"Feedback sent to Gemini for {stage_name.lower()} retry"):
+                st.code(stage_feedback)
             st.write(f"  Regenerating with {stage_name.lower()} feedback...")
             try:
                 image = generate_linkedin_image(images, stage_feedback, custom_prompt)
