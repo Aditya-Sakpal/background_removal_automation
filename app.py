@@ -788,12 +788,13 @@ def generate_linkedin_image(
     # 7. Generation prompt — short, conversational, no trigger words
     prompt_text = """Create a professional LinkedIn-style headshot inspired by the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the gold-standard reference (first image) and the vignette reference (second image).
 
-TOP PRIORITY — HEADROOM (most important rule, do not violate):
-- There MUST be a large, obvious band of empty background ABOVE the top of the hair.
-- The top of the hair must sit roughly 25-30% of the way DOWN from the top edge of the frame. The upper ~25-30% of the image is pure background, with NO part of the subject in it.
-- Match the headroom shown in the gold-standard reference (first image) — that much space above the head, or more.
-- The eyes should sit at or slightly BELOW the horizontal midline of the frame, NOT in the upper third. This pushes the head down and forces visible space above it.
-- FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head. If the top of the hair is anywhere in the upper 20% of the frame, the image is WRONG.
+TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING (most important rule):
+- Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame. The subject's head + shoulders should occupy only the LOWER PORTION of the image, NOT fill the entire frame from top to bottom.
+- Think medium-wide shot, not close-up. The camera is pulled back further than a typical headshot. The hair, face, neck, and shoulders together take roughly the lower 65-75% of the frame — never more.
+- The upper ~25-30% of the frame must be pure background with NO part of the subject in it.
+- The eyes should sit at or slightly BELOW the horizontal midline of the frame (around 50-60% down from the top), NOT in the upper third.
+- IMPORTANT — do NOT try to add headroom by simply translating the subject downward in a tight crop. That just cuts off the shoulders/torso at the bottom. Instead, SHRINK the subject by zooming out — the subject must appear visibly smaller, with both empty background above the head AND the full shoulders/upper torso visible below.
+- FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head or the shoulders.
 
 Style notes:
 - A polished, photorealistic portrait with a warm, confident expression and a slight smile.
@@ -810,12 +811,13 @@ Background — vertical gradient + radial vignette (match gold-standard referenc
 - Net effect: the corners are dark, the bottom is darker still (fading into the subject's lower clothing), and the area behind the head has a softly-lit "halo" that draws the eye to the face.
 
 Composition (landscape 3:2):
-- The face takes around 25-35% of the frame's vertical height (smaller than you might default to — this is what creates the headroom).
+- The face (hairline to chin) takes around 20-30% of the frame's vertical height — smaller than a typical headshot. This is a ZOOMED-OUT framing.
+- The full subject from top-of-hair to upper-torso fits inside the lower two-thirds of the frame, leaving the top third as empty background.
 - The subject is centred horizontally — equal background on left and right.
 - Both shoulders are fully visible with a small margin, and the collar/neckline of the clothing is visible at the bottom.
 - A slightly angled pose works well; avoid a straight-on stare.
 
-Self-check before finishing: cover the lower half of your output with your hand — the upper half should show clear background above the head, with the head sitting mostly in the lower half of the frame. If the head dominates the upper half, regenerate with the camera pulled back further.
+Self-check before finishing: cover the lower half of your output with your hand — the upper half should show clear background above the head, with the head sitting mostly in the lower half of the frame. If the head dominates the upper half OR if the shoulders are cropped at the bottom, you've zoomed in too tight — pull the camera back further so the subject takes up less of the frame.
 
 Output one bright, polished landscape headshot at 3:2."""
 
@@ -1083,16 +1085,23 @@ Do NOT evaluate anything else — not the person, not the clothing, not the back
 
 If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
 
+IMPORTANT — when telling the generator to "add more space above the head", you MUST also explain HOW. The model cannot simply add empty pixels above the existing subject without cropping the bottom. The actionable fix is to ZOOM OUT (use a wider camera framing) so the SUBJECT APPEARS SMALLER in the frame, which naturally creates headroom above the head WITHOUT cutting off the shoulders or torso.
+
+Always phrase the fix this way (template):
+"Pull the camera back further / use a wider crop so the subject occupies less of the frame vertically — the head and shoulders should be smaller, leaving a generous band of empty background above the hair. Do not zoom in tighter; do not simply translate the subject down (that would crop the shoulders). The subject must appear visibly smaller so the headroom comes from the extra background area, not from pushing the body out of frame."
+
+Add a one-sentence note about the current image (e.g. "Currently the head is pressed near the top edge with no breathing room").
+
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
     "is_approved": true or false,
-    "things_to_improve": false or "actionable fix instruction if it failed"
+    "things_to_improve": false or "actionable fix instruction following the template above if it failed"
 }"""
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a strict single-criterion headroom reviewer. Respond only with JSON, no markdown fences."},
+            {"role": "system", "content": "You are a strict single-criterion headroom reviewer. When instructing fixes, always tell the generator to zoom out / shrink the subject — never just 'add more space above'. Respond only with JSON, no markdown fences."},
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
         max_tokens=300,
