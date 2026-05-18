@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import json
 import os
@@ -207,23 +208,58 @@ def call_gemini_with_retry(
     are raised immediately.
     """
     last_err: Exception | None = None
+    last_response = None  # noqa: F841 — kept in scope so it's visible at the breakpoint below
     for attempt in range(1, max_attempts + 1):
+        response = None
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
             )
+            last_response = response  # noqa: F841 — inspect this in the debugger
             return extract_image_from_gemini_response(response, context=context)
         except GeminiTransientError as e:
             last_err = e
+            last_response = response  # noqa: F841 — inspect this in the debugger
+            # ────────────────────────────────────────────────────────────
+            # 🔴 BREAKPOINT HERE — Gemini returned a transient failure.
+            #
+            # Inspect in the Variables panel:
+            #   response             → full SDK response object
+            #   response.candidates  → list; check candidates[0].finish_reason
+            #   response.prompt_feedback → block_reason / block_reason_message
+            #   response.candidates[0].safety_ratings  → per-category scores
+            #   response.candidates[0].content         → None means refused
+            #   contents             → exact inputs (images + prompt) sent
+            #   context              → which step failed ("profile image", etc.)
+            #   e                    → parsed error message
+            # ────────────────────────────────────────────────────────────
+            print(f"[DEBUG] Gemini transient on attempt {attempt}: {e}")
+            if response is not None:
+                print(f"[DEBUG] finish_reason: {getattr(response.candidates[0], 'finish_reason', None)}")
+                print(f"[DEBUG] prompt_feedback: {getattr(response, 'prompt_feedback', None)}")
+                print(f"[DEBUG] safety_ratings: {getattr(response.candidates[0], 'safety_ratings', None)}")
             if attempt < max_attempts:
-                # tiny backoff so we don't hammer the API
                 import time
 
                 time.sleep(0.5 * attempt)
                 continue
             break
+        except Exception as e:
+            # Catch-all for non-transient failures so we can still inspect the response.
+            last_err = e
+            last_response = response  # noqa: F841 — inspect this in the debugger
+            # ────────────────────────────────────────────────────────────
+            # 🔴 BREAKPOINT HERE — Gemini returned a HARD failure (safety
+            # block, prompt rejection, SDK error, etc.). Same inspection
+            # variables as above.
+            # ────────────────────────────────────────────────────────────
+            print(f"[DEBUG] Gemini hard failure on attempt {attempt}: {type(e).__name__}: {e}")
+            if response is not None:
+                print(f"[DEBUG] finish_reason: {getattr(response.candidates[0], 'finish_reason', None)}")
+                print(f"[DEBUG] prompt_feedback: {getattr(response, 'prompt_feedback', None)}")
+            raise
     raise RuntimeError(
         f"Gemini failed {max_attempts} times for {context} (transient). Last error: {last_err}"
     )
@@ -322,6 +358,31 @@ def _prepare_thumb_for_vision(image_bytes: bytes, max_edge: int = 384) -> tuple[
 def _prepare_thumb_for_ranking(image_bytes: bytes, max_edge: int = 768) -> tuple[bytes, str]:
     """Larger thumbs for gallery-type scoring (event vs studio, face clarity)."""
     return _prepare_thumb_for_vision(image_bytes, max_edge=max_edge)
+
+
+def _downscale_for_pool(image_bytes: bytes, max_edge: int = 1500) -> bytes:
+    """
+    Shrink a freshly-downloaded source image so the pool doesn't hold huge originals
+    in memory. The gallery banner output is only 1176x516, so a 1500px long edge is
+    plenty of detail with a fraction of the memory cost.
+    Re-encoded as JPEG q=88 to keep the in-memory representation compact.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > max_edge:
+                scale = max_edge / max(w, h)
+                im = im.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=88, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        # If decoding fails, leave the bytes untouched — caller already validates.
+        return image_bytes
 
 
 def _fallback_top_indices_by_aspect(rows: list[dict], target_aspect: float, k: int) -> list[int]:
@@ -975,33 +1036,20 @@ If none of the three rejection conditions apply, return is_approved=true and thi
 # ---------------------------------------------------------------------------
 # GUARDRAIL 2b – LinkedIn profile composition check (gradient / headroom / centering)
 # ---------------------------------------------------------------------------
-def linkedin_composition_guardrail(generated_image: bytes) -> dict:
+def headroom_guardrail(generated_image: bytes) -> dict:
     """
-    Strictly checks the generated LinkedIn headshot against FOUR composition rules,
-    using two client-approved reference images:
-      1. Headroom — anchored to the VIGNETTE reference (Zakir Khan).
-      2. Black bottom gradient that blends into the subject — anchored to the GOLD STANDARD (Netanyahu).
-      3. Horizontal centring — anchored to the VIGNETTE reference (Zakir Khan).
-      4. Soft radial vignette darkening corners — anchored to the VIGNETTE reference (Zakir Khan).
+    Single-criterion guardrail: does the generated LinkedIn headshot have enough
+    headroom above the subject's head? Anchored to the VIGNETTE reference image.
 
     Returns {"is_approved": bool, "things_to_improve": str | False}.
-    On failure, things_to_improve contains an actionable, prompt-ready description
-    of what must change in the next regeneration attempt.
     """
     client = get_openai_client()
 
-    with open(COMPOSITION_GOLD_STANDARD_PATH, "rb") as f:
-        gold_standard_bytes = f.read()
     with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
         vignette_ref_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- GOLD-STANDARD REFERENCE (anchor for the BLACK BOTTOM GRADIENT rule) ---"},
-        {
-            "type": "image_url",
-            "image_url": {"url": encode_image_for_openai(gold_standard_bytes, "image/jpeg"), "detail": "high"},
-        },
-        {"type": "text", "text": "--- VIGNETTE REFERENCE (anchor for the HEADROOM, CENTRING, and VIGNETTE rules) ---"},
+        {"type": "text", "text": "--- HEADROOM REFERENCE (the empty band above the head is what we want to match) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(vignette_ref_bytes, "image/png"), "detail": "high"},
@@ -1013,53 +1061,177 @@ def linkedin_composition_guardrail(generated_image: bytes) -> dict:
         },
     ]
 
-    prompt = """You are a STRICT composition reviewer for AI-generated LinkedIn profile headshots.
+    prompt = """You are a STRICT headroom reviewer for AI-generated LinkedIn profile headshots.
 
-You are given THREE images:
-1. GOLD-STANDARD REFERENCE — anchors the BLACK BOTTOM GRADIENT rule.
-2. VIGNETTE REFERENCE — anchors the HEADROOM, HORIZONTAL CENTRING, and RADIAL VIGNETTE rules.
-3. The generated LinkedIn image to evaluate.
+You are given TWO images:
+1. HEADROOM REFERENCE — anchors the headroom rule.
+2. The generated LinkedIn image to evaluate.
 
-You MUST evaluate the generated image against ONLY the four rules below. Do not invent additional criteria. Do not evaluate the person, clothing, colour palette, or background hue — evaluate ONLY the composition pattern. Do not flag face quality, lighting style, accessories, or anything not listed.
+Check ONE thing only: is there enough empty background ABOVE the top of the subject's hair in the generated image, matching (or exceeding) the reference?
 
-RULES:
+In the reference image, observe the gap between the top of the hair and the top edge of the frame — there is a clearly visible band of empty background occupying roughly the upper 20-25% of the frame.
 
-1. **Headroom above the subject's head** (anchor: VIGNETTE reference) — Look at the gap between the top of the hair and the top edge of the vignette reference: there is a clearly visible band of empty background occupying roughly the upper 20-25% of the frame. The generated image must show a comparable amount of empty background above the head. PASS if the empty band above the hair takes at least ~15% of the frame's vertical height. FAIL if the hair touches or nearly touches the top edge, the hair sits in the top 10% of the frame, or there is noticeably less headroom than the vignette reference.
+PASS if the empty band above the hair in the generated image takes at least ~15% of the frame's vertical height.
 
-2. **Black bottom gradient that blends into the subject** (anchor: GOLD-STANDARD reference) — Look at the bottom of the gold-standard reference. Two things are true and BOTH must be matched in the generated image:
-   (a) The background fades into a deep BLACK band along the bottom edge of the frame.
-   (b) That black band extends UPWARD into the lower portion of the subject — the bottom of the jacket/shirt is partially absorbed into the darkness, with NO sharp visible edge between the subject's clothing and the bottom of the frame. The subject appears to merge into the black at the bottom.
-   PASS only if BOTH (a) and (b) are clearly present. FAIL if the background is a flat colour with no dark bottom band, OR if only a corner vignette is present without a dark bottom band, OR if the bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
+FAIL if any of these are true:
+- The hair touches or nearly touches the top edge of the frame.
+- The top of the hair sits in the upper 10% of the frame.
+- There is noticeably less headroom than the reference.
+- The top of the head is cropped at all.
 
-3. **Horizontal centring** (anchor: VIGNETTE reference) — In the vignette reference, the subject sits roughly centred with similar amounts of background on the left and the right (slight off-centre is acceptable). PASS if the generated subject is centred or only very slightly off-centre. FAIL if the subject is clearly shifted to the left or right side of the frame.
+Do NOT evaluate anything else — not the person, not the clothing, not the background colour, not the lighting, not the vignette, not centering. Headroom ONLY.
 
-4. **Soft radial vignette** (anchor: VIGNETTE reference) — Look at the vignette reference: the area immediately behind/around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker — a clear, smooth radial darkening from the centre outward. The generated image must show this same effect. PASS if the corners of the frame are clearly darker than the area directly behind the subject's head, with a smooth fade (no banding). FAIL if the background is a flat colour from edge to edge with no radial darkening, OR if the corners are the same brightness as the centre, OR if the vignette is so heavy/hard that the subject is silhouetted or a black border is visible.
-
-For each FAILED rule, write a SHORT, SPECIFIC, ACTIONABLE instruction (one sentence each) that can be fed directly back to the image generator to fix the issue on the next attempt. Examples:
-- "Move the subject DOWN in the frame so the top of the hair sits 20-25% down from the top edge, matching the vignette reference — currently the head is pressed against the top edge."
-- "Add a smooth black gradient across the bottom of the background AND let it extend upward into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black, matching the gold-standard reference — currently the background is a flat colour and the subject's lower edge is fully visible."
-- "Recenter the subject horizontally — the person is currently shifted to the left/right of the frame."
-- "Apply a soft radial vignette so the corners are clearly darker than the area behind the subject's head, matching the vignette reference — currently the background brightness is uniform from edge to edge."
+If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
-    "headroom_pass": true or false,
-    "gradient_pass": true or false,
-    "centering_pass": true or false,
-    "vignette_pass": true or false,
     "is_approved": true or false,
-    "things_to_improve": false or "concatenated actionable fix instructions for every failed rule"
-}
-
-is_approved is true ONLY if ALL FOUR rules pass. If any rule fails, is_approved is false and things_to_improve is the concatenated instructions for the failed rules."""
+    "things_to_improve": false or "actionable fix instruction if it failed"
+}"""
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a strict composition reviewer. Check ONLY the three rules listed. Respond only with JSON, no markdown fences."},
+            {"role": "system", "content": "You are a strict single-criterion headroom reviewer. Respond only with JSON, no markdown fences."},
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
-        max_tokens=600,
+        max_tokens=300,
+        temperature=0,
+    )
+
+    return parse_json_response(response.choices[0].message.content)
+
+
+def bottom_gradient_guardrail(generated_image: bytes) -> dict:
+    """
+    Single-criterion guardrail: does the generated LinkedIn headshot have a black
+    bottom gradient that blends UP into the subject's clothing? Anchored to the
+    GOLD-STANDARD reference image.
+
+    Returns {"is_approved": bool, "things_to_improve": str | False}.
+    """
+    client = get_openai_client()
+
+    with open(COMPOSITION_GOLD_STANDARD_PATH, "rb") as f:
+        gold_standard_bytes = f.read()
+
+    image_content = [
+        {"type": "text", "text": "--- BOTTOM-GRADIENT REFERENCE (the black band fading up into the jacket is what we want to match) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(gold_standard_bytes, "image/jpeg"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
+        },
+    ]
+
+    prompt = """You are a STRICT bottom-gradient reviewer for AI-generated LinkedIn profile headshots.
+
+You are given TWO images:
+1. BOTTOM-GRADIENT REFERENCE — anchors the rule.
+2. The generated LinkedIn image to evaluate.
+
+Check ONE thing only: does the generated image have the same black-bottom-gradient effect as the reference?
+
+In the reference image, observe the bottom of the frame. TWO things are true and BOTH must be matched in the generated image:
+(a) The background fades into a deep BLACK band along the bottom edge of the frame.
+(b) That black band extends UPWARD into the lower portion of the subject — the bottom of the jacket/shirt is partially absorbed into the darkness, with NO sharp visible edge between the subject's clothing and the bottom of the frame. The subject appears to merge into the black at the bottom.
+
+PASS only if BOTH (a) and (b) are clearly present.
+
+FAIL if any of these are true:
+- The background is a flat colour with no dark bottom band.
+- Only a corner vignette is present, without a dark bottom band.
+- The bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
+- The black band exists but does NOT extend up into the subject's clothing (i.e. there's a hard visible edge where the subject ends).
+
+Do NOT evaluate anything else — not the person, not the clothing colour, not the background hue, not the lighting, not the vignette, not headroom, not centering. Bottom-gradient ONLY.
+
+If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
+
+Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
+{
+    "is_approved": true or false,
+    "things_to_improve": false or "actionable fix instruction if it failed"
+}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a strict single-criterion bottom-gradient reviewer. Respond only with JSON, no markdown fences."},
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=300,
+        temperature=0,
+    )
+
+    return parse_json_response(response.choices[0].message.content)
+
+
+def vignette_guardrail(generated_image: bytes) -> dict:
+    """
+    Single-criterion guardrail: does the generated LinkedIn headshot show a soft
+    radial vignette that darkens the corners relative to the area behind the head?
+    Anchored to the VIGNETTE reference image.
+
+    Returns {"is_approved": bool, "things_to_improve": str | False}.
+    """
+    client = get_openai_client()
+
+    with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
+        vignette_ref_bytes = f.read()
+
+    image_content = [
+        {"type": "text", "text": "--- VIGNETTE REFERENCE (the soft radial darkening of the corners is what we want to match) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(vignette_ref_bytes, "image/png"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
+        },
+    ]
+
+    prompt = """You are a STRICT vignette reviewer for AI-generated LinkedIn profile headshots.
+
+You are given TWO images:
+1. VIGNETTE REFERENCE — anchors the rule.
+2. The generated LinkedIn image to evaluate.
+
+Check ONE thing only: does the generated image have the same soft radial vignette effect as the reference?
+
+In the reference image, observe how the area immediately behind/around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker — a clear, smooth radial darkening from the centre outward.
+
+PASS if the corners of the frame in the generated image are clearly darker than the area directly behind the subject's head, with a smooth fade and no visible banding.
+
+FAIL if any of these are true:
+- The background is a flat colour from edge to edge with no radial darkening.
+- The corners are the same brightness as the centre.
+- The vignette is so heavy or hard-edged that the subject is silhouetted, or a visible black border ring appears.
+- The fade has visible banding or hard transitions.
+
+Do NOT evaluate anything else — not the person, not the clothing, not the background colour, not the lighting style, not headroom, not centering, not the bottom gradient. Radial vignette ONLY.
+
+If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
+
+Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
+{
+    "is_approved": true or false,
+    "things_to_improve": false or "actionable fix instruction if it failed"
+}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a strict single-criterion vignette reviewer. Respond only with JSON, no markdown fences."},
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=300,
         temperature=0,
     )
 
@@ -1211,6 +1383,7 @@ if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (Google API)", key="btn_
                         try:
                             data = download_image_bytes(url)
                             if data and len(data) > 500:
+                                data = _downscale_for_pool(data)
                                 break
                         except Exception as ex:
                             err = str(ex)
@@ -1471,15 +1644,30 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         status.update(label="Step 1/5 — Input guardrail passed", state="complete")
 
     # Step 2: profile generation with up to MAX_RETRY attempts.
-    # On each attempt we run two guardrails:
-    #   (a) output_guardrail — face resemblance / severe artifacts
-    #   (b) linkedin_composition_guardrail — black gradient bottom, headroom, centering
-    # If either fails we feed the feedback back to Gemini and regenerate.
-    # After MAX_RETRY attempts, the latest generated image is accepted as-is.
+    # On each attempt we run FOUR guardrails:
+    #   (a) output_guardrail       — face resemblance / severe artifacts
+    #   (b) headroom_guardrail     — empty band above the head
+    #   (c) bottom_gradient_guardrail — black band fading into the subject's clothing
+    #   (d) vignette_guardrail     — soft radial darkening of the corners
+    # The three single-criterion composition guardrails run sequentially; any
+    # failures are collected and concatenated into one feedback string fed back
+    # to Gemini for the next attempt. After MAX_RETRY attempts, the latest
+    # generated image is accepted as-is.
     generated_image = None
     output_check = None
-    composition_check = None
     composition_feedback: str | None = None
+
+    def _run_single_guardrail(name: str, fn, *args) -> tuple[bool, str | None]:
+        """Wrap a guardrail call so a failure inside it doesn't kill the pipeline."""
+        try:
+            result = fn(*args)
+        except Exception as e:
+            st.warning(f"{name} guardrail errored ({e}) — treating as passed.")
+            return True, None
+        passed = bool(result.get("is_approved"))
+        feedback = result.get("things_to_improve") if not passed else None
+        return passed, feedback if isinstance(feedback, str) else None
+
     with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
         for attempt in range(1, MAX_RETRY + 1):
             st.write(f"Attempt {attempt}/{MAX_RETRY}...")
@@ -1489,6 +1677,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 st.error(f"Profile generation failed: {e}")
                 st.stop()
 
+            # (a) Face / artifact / appropriateness check — hard fail aborts the run.
             try:
                 output_check = output_guardrail(generated_image, images)
             except Exception as e:
@@ -1498,21 +1687,50 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 st.error(f"Profile failed output guardrail: {output_check.get('things_to_improve', 'unknown reason')}")
                 st.stop()
 
-            try:
-                composition_check = linkedin_composition_guardrail(generated_image)
-            except Exception as e:
-                st.warning(f"Composition guardrail errored ({e}) — accepting current image.")
-                composition_check = {"is_approved": True, "things_to_improve": False}
+            # (b)(c)(d) Three single-criterion composition guardrails, sequential.
+            failures: list[str] = []
 
-            if composition_check.get("is_approved"):
-                st.write(f"Composition guardrail passed on attempt {attempt}.")
+            headroom_pass, headroom_fb = _run_single_guardrail(
+                "Headroom", headroom_guardrail, generated_image
+            )
+            st.write(
+                f"  • Headroom guardrail: {'PASS' if headroom_pass else 'FAIL'}"
+                + (f" — {headroom_fb}" if headroom_fb else "")
+            )
+            if not headroom_pass and headroom_fb:
+                failures.append(f"Headroom: {headroom_fb}")
+
+            gradient_pass, gradient_fb = _run_single_guardrail(
+                "Bottom gradient", bottom_gradient_guardrail, generated_image
+            )
+            st.write(
+                f"  • Bottom-gradient guardrail: {'PASS' if gradient_pass else 'FAIL'}"
+                + (f" — {gradient_fb}" if gradient_fb else "")
+            )
+            if not gradient_pass and gradient_fb:
+                failures.append(f"Bottom gradient: {gradient_fb}")
+
+            vignette_pass, vignette_fb = _run_single_guardrail(
+                "Vignette", vignette_guardrail, generated_image
+            )
+            st.write(
+                f"  • Vignette guardrail: {'PASS' if vignette_pass else 'FAIL'}"
+                + (f" — {vignette_fb}" if vignette_fb else "")
+            )
+            if not vignette_pass and vignette_fb:
+                failures.append(f"Vignette: {vignette_fb}")
+
+            if not failures:
+                st.write(f"All composition guardrails passed on attempt {attempt}.")
                 break
 
-            improvements = composition_check.get("things_to_improve") or "Composition rules failed."
-            st.write(f"Composition guardrail failed on attempt {attempt}: {improvements}")
+            improvements = " ".join(failures)
+            st.write(f"Composition guardrails failed on attempt {attempt}: {improvements}")
             composition_feedback = improvements
             if attempt == MAX_RETRY:
-                st.warning(f"Composition guardrail still failing after {MAX_RETRY} attempts — accepting the latest image as-is.")
+                st.warning(
+                    f"Composition guardrails still failing after {MAX_RETRY} attempts — accepting the latest image as-is."
+                )
 
         if generated_image is None:
             st.error("Profile generation failed.")
@@ -1547,7 +1765,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                     candidate = download_image_bytes(url)
                     ok, decode_err = is_valid_image_bytes(candidate) if candidate else (False, "No data")
                     if candidate and len(candidate) > 500 and ok:
-                        data = candidate
+                        data = _downscale_for_pool(candidate)
                         break
                     err = decode_err or "Downloaded bytes are not a valid image"
                 except Exception as ex:
@@ -1589,6 +1807,14 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         if len(top_indices) < REFERENCE_TOP_K_OPENAI:
             st.error(f"Ranking produced only {len(top_indices)} images; expected {REFERENCE_TOP_K_OPENAI}.")
             st.stop()
+
+        # Free non-selected image payloads — they account for ~half of pool memory.
+        top_set = set(top_indices)
+        for i, row in enumerate(rows):
+            if i not in top_set:
+                row["bytes"] = None
+        gc.collect()
+
         status.update(label="Step 4/5 — Top 10 selected", state="complete")
 
     # Step 5: regenerate top 10 (serial, no retry)
@@ -1615,6 +1841,12 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             gallery_outputs.append((f"gallery{j}.webp", webp_b, ok))
             progress.progress(int((j / REFERENCE_TOP_K_OPENAI) * 100), text=f"Processing {j}/{REFERENCE_TOP_K_OPENAI}")
 
+            # Free the processed source + any transient PIL/numpy objects before
+            # the next iteration so peak memory stays bounded.
+            rows[pool_idx]["bytes"] = None
+            del png_banner, src
+            gc.collect()
+
     # Build zip output
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
@@ -1629,6 +1861,13 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         "zip_bytes": zip_buffer.getvalue(),
         "artist_folder": artist_folder,
     }
+
+    # Release the pool + rows so Streamlit doesn't hold onto raw image bytes
+    # across reruns. Final output is now fully in result_data + the zip buffer.
+    st.session_state.reference_pool_rows = None
+    rows = None
+    candidates = None
+    gc.collect()
 
 result_data = st.session_state.result_data
 if result_data:
