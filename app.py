@@ -707,82 +707,40 @@ def generate_linkedin_image(
 
     contents: list = []
 
-    # 1. GOLD STANDARD composition reference (Netanyahu) — black bottom gradient anchor.
-    gold_standard_ref = Image.open(COMPOSITION_GOLD_STANDARD_PATH).convert("RGB")
-    contents.append(gold_standard_ref)
+    # 1. CANONICAL composition reference (Zakir Khan) — the single source of truth
+    #    for all four composition rules: headroom (subject size), black bottom
+    #    gradient blending into the clothing, horizontal centring, and radial vignette.
+    composition_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
+    contents.append(composition_ref)
     contents.append(
-        "The first image is the GOLD STANDARD COMPOSITION REFERENCE — this is exactly "
-        "what the client wants the final output to look like in terms of composition. "
-        "Do NOT copy the person, their clothing, the suit, the tie, the pin, or the "
-        "background hue. Copy ONLY the composition pattern, which has THREE features "
-        "you MUST replicate:\n"
-        "  (a) HEADROOM — there is a generous band of empty background above the top "
-        "of the hair, occupying roughly the upper 20-25% of the frame.\n"
-        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep black "
-        "band along the bottom edge of the frame, AND this black band extends UPWARD "
+        "The first image is the CANONICAL COMPOSITION REFERENCE. Replicate its "
+        "composition exactly. Do NOT copy the person, the maroon/red background hue, "
+        "the microphone, the blazer, or any clothing. Copy ONLY the composition pattern, "
+        "which has FOUR features you must match:\n"
+        "  (a) SUBJECT SIZE / HEADROOM — notice how small the subject is relative to "
+        "the frame: there is a generous band of empty background above the top of the "
+        "hair, occupying roughly the upper 20-25% of the frame. The subject is framed "
+        "from a wider distance — the head and shoulders take only the lower portion "
+        "of the image, never filling it from edge to edge.\n"
+        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep dark "
+        "band along the bottom edge of the frame, and that dark band extends UPWARD "
         "into the lower portion of the subject's clothing so the bottom of the jacket "
-        "blends into the darkness with no sharp visible edge. The subject appears to "
-        "merge into black at the bottom — there is no hard boundary between the "
-        "subject's lower clothing and the frame bottom.\n"
+        "dissolves into darkness with no sharp visible edge.\n"
         "  (c) HORIZONTAL CENTRING — the subject sits roughly centred with similar "
-        "amounts of background on the left and the right."
+        "amounts of background on the left and the right.\n"
+        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around the head is "
+        "the brightest part of the background; the corners and edges are noticeably "
+        "darker in a smooth radial fade (no hard mask, no heavy border)."
     )
 
-    # 2. VIGNETTE reference (Zakir Khan) — anchors radial vignette + headroom + centring.
-    vignette_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
-    contents.append(vignette_ref)
-    contents.append(
-        "The second image is the VIGNETTE COMPOSITION REFERENCE. Do NOT copy the "
-        "person, the maroon/red hue, the microphone, the blazer, or the clothing. "
-        "Copy ONLY these three composition features:\n"
-        "  (a) RADIAL VIGNETTE — there is a clear radial darkening from a brighter, "
-        "softly-lit region behind/around the subject's head fading into noticeably "
-        "darker corners and edges. The corners of the frame are distinctly darker "
-        "than the area immediately behind the subject's head. This is a SOFT, smooth "
-        "radial fade — not a hard mask, not a black border, not a vignette so heavy "
-        "that the subject is silhouetted.\n"
-        "  (b) HEADROOM — match the empty background above the top of the hair: "
-        "roughly the upper 20-25% of the frame is empty background, the hair does "
-        "NOT touch the top edge.\n"
-        "  (c) HORIZONTAL CENTRING — the subject's head and shoulders sit roughly "
-        "centred horizontally with similar amounts of background on the left and "
-        "the right of the person."
-    )
-
-    # 3. Style reference image
-    style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
-    contents.append(style_ref)
-    contents.append(
-        "The third image is a style reference for cohesive, polished portrait look. "
-        "Use it for inspiration on lighting and how the subject sits naturally in the "
-        "frame. The final background should combine the gold-standard pattern (clean "
-        "colour at top → black at bottom) with the vignette reference's radial "
-        "darkening at the corners and edges."
-    )
-
-    # 4. Head-space / framing reference — reinforces the headroom rule
-    head_space_ref = Image.open(HEAD_SPACE_REFERENCE_PATH).convert("RGB")
-    contents.append(head_space_ref)
-    contents.append(
-        "The fourth image reinforces the HEAD-SPACE rule. Match this much (or more) "
-        "empty background above the head. Do NOT copy the person."
-    )
-
-    # 5. Gradient reference — reinforces the black-bottom gradient rule
-    gradient_ref = Image.open(GRADIENT_REFERENCE_PATH).convert("RGB")
-    contents.append(gradient_ref)
-    contents.append(
-        "The fifth image reinforces the BLACK BOTTOM GRADIENT rule. Match the "
-        "top-colour-to-black vertical fade. Do NOT copy the person or the orange hue."
-    )
-
-    # 6. User's input photos
+    # 2. User's input photos
     for img_bytes, _ in images:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         contents.append(pil_img)
     contents.append(
-        "The remaining images are the subject photos. Use them as inspiration for the "
-        "person's appearance — facial features, skin tone, hair, and clothing."
+        "The remaining images are the subject photos. Use them only for the person's "
+        "appearance — facial features, skin tone, hair, and clothing. For composition "
+        "and background, follow the canonical composition reference (first image)."
     )
 
     # 7. Generation prompt — short, conversational, no trigger words
@@ -1051,12 +1009,12 @@ def headroom_guardrail(generated_image: bytes) -> dict:
         vignette_ref_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- HEADROOM REFERENCE (the empty band above the head is what we want to match) ---"},
+        {"type": "text", "text": "--- IMAGE 1: CANONICAL REFERENCE (zakir-khan_Comedian.png) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(vignette_ref_bytes, "image/png"), "detail": "high"},
         },
-        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {"type": "text", "text": "--- IMAGE 2: GENERATED LINKEDIN IMAGE (to evaluate) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
@@ -1066,45 +1024,41 @@ def headroom_guardrail(generated_image: bytes) -> dict:
     prompt = """You are a STRICT headroom reviewer for AI-generated LinkedIn profile headshots.
 
 You are given TWO images:
-1. HEADROOM REFERENCE — anchors the headroom rule.
-2. The generated LinkedIn image to evaluate.
+- IMAGE 1: the canonical reference (zakir-khan_Comedian.png).
+- IMAGE 2: the generated LinkedIn image to evaluate.
 
-Check ONE thing only: is there enough empty background ABOVE the top of the subject's hair in the generated image, matching (or exceeding) the reference?
+Check ONE thing only: does IMAGE 2 have enough empty background ABOVE the top of the subject's hair, matching (or exceeding) the headroom shown in IMAGE 1?
 
-In the reference image, observe the gap between the top of the hair and the top edge of the frame — there is a clearly visible band of empty background occupying roughly the upper 20-25% of the frame.
+Notice in IMAGE 1: the subject is framed at a wider distance — the head sits in the lower portion of the frame, and there is a clearly visible band of empty background occupying roughly the upper 20-25% of the frame above the hair.
 
-PASS if the empty band above the hair in the generated image takes at least ~15% of the frame's vertical height.
+PASS if the empty band above the hair in IMAGE 2 takes at least ~15% of the frame's vertical height.
 
 FAIL if any of these are true:
-- The hair touches or nearly touches the top edge of the frame.
+- The hair in IMAGE 2 touches or nearly touches the top edge of the frame.
 - The top of the hair sits in the upper 10% of the frame.
-- There is noticeably less headroom than the reference.
+- IMAGE 2 has noticeably less headroom than IMAGE 1.
 - The top of the head is cropped at all.
 
-Do NOT evaluate anything else — not the person, not the clothing, not the background colour, not the lighting, not the vignette, not centering. Headroom ONLY.
+Do NOT evaluate anything else — not the person, clothing, background colour, lighting, vignette, or centring. Headroom ONLY.
 
-If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
+If the rule fails, write the fix instruction using direct image comparison. The actionable fix is always: make the SUBJECT IN IMAGE 2 smaller (zoom out / wider crop) so its size matches the subject in IMAGE 1. Do NOT simply add empty pixels above the existing subject — that would crop the shoulders.
 
-IMPORTANT — when telling the generator to "add more space above the head", you MUST also explain HOW. The model cannot simply add empty pixels above the existing subject without cropping the bottom. The actionable fix is to ZOOM OUT (use a wider camera framing) so the SUBJECT APPEARS SMALLER in the frame, which naturally creates headroom above the head WITHOUT cutting off the shoulders or torso.
-
-Always phrase the fix this way (template):
-"Pull the camera back further / use a wider crop so the subject occupies less of the frame vertically — the head and shoulders should be smaller, leaving a generous band of empty background above the hair. Do not zoom in tighter; do not simply translate the subject down (that would crop the shoulders). The subject must appear visibly smaller so the headroom comes from the extra background area, not from pushing the body out of frame."
-
-Add a one-sentence note about the current image (e.g. "Currently the head is pressed near the top edge with no breathing room").
+Always phrase the fix this way (template, fill in the bracketed parts):
+"Reduce the size of the subject in image 2 (the generated image) and make it equivalent to the size of the subject in image 1 (zakir-khan_Comedian.png) — currently the head in image 2 [describe how it's too large or too close to the top edge in one short phrase]. Pull the camera back / use a wider crop so the head and shoulders in image 2 occupy the same proportion of the frame as in image 1, leaving a generous band of empty background above the hair. Do not zoom in tighter; do not simply translate the subject down (that would crop the shoulders)."
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
     "is_approved": true or false,
-    "things_to_improve": false or "actionable fix instruction following the template above if it failed"
+    "things_to_improve": false or "fix instruction following the template above if it failed"
 }"""
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a strict single-criterion headroom reviewer. When instructing fixes, always tell the generator to zoom out / shrink the subject — never just 'add more space above'. Respond only with JSON, no markdown fences."},
+            {"role": "system", "content": "You are a strict single-criterion headroom reviewer. When instructing fixes, always tell the generator to shrink the subject in image 2 to match the size of the subject in image 1. Respond only with JSON, no markdown fences."},
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
-        max_tokens=300,
+        max_tokens=400,
         temperature=0,
     )
 
@@ -1113,24 +1067,24 @@ Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 
 def bottom_gradient_guardrail(generated_image: bytes) -> dict:
     """
-    Single-criterion guardrail: does the generated LinkedIn headshot have a black
-    bottom gradient that blends UP into the subject's clothing? Anchored to the
-    GOLD-STANDARD reference image.
+    Single-criterion guardrail: does the generated LinkedIn headshot have a dark
+    bottom gradient that blends UP into the subject's clothing, matching the
+    canonical reference image (zakir-khan_Comedian.png)?
 
     Returns {"is_approved": bool, "things_to_improve": str | False}.
     """
     client = get_openai_client()
 
-    with open(COMPOSITION_GOLD_STANDARD_PATH, "rb") as f:
-        gold_standard_bytes = f.read()
+    with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
+        ref_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- BOTTOM-GRADIENT REFERENCE (the black band fading up into the jacket is what we want to match) ---"},
+        {"type": "text", "text": "--- IMAGE 1: CANONICAL REFERENCE (zakir-khan_Comedian.png) ---"},
         {
             "type": "image_url",
-            "image_url": {"url": encode_image_for_openai(gold_standard_bytes, "image/jpeg"), "detail": "high"},
+            "image_url": {"url": encode_image_for_openai(ref_bytes, "image/png"), "detail": "high"},
         },
-        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {"type": "text", "text": "--- IMAGE 2: GENERATED LINKEDIN IMAGE (to evaluate) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
@@ -1140,40 +1094,41 @@ def bottom_gradient_guardrail(generated_image: bytes) -> dict:
     prompt = """You are a STRICT bottom-gradient reviewer for AI-generated LinkedIn profile headshots.
 
 You are given TWO images:
-1. BOTTOM-GRADIENT REFERENCE — anchors the rule.
-2. The generated LinkedIn image to evaluate.
+- IMAGE 1: the canonical reference (zakir-khan_Comedian.png).
+- IMAGE 2: the generated LinkedIn image to evaluate.
 
-Check ONE thing only: does the generated image have the same black-bottom-gradient effect as the reference?
+Check ONE thing only: does IMAGE 2 have the same dark-bottom-gradient-merging-into-subject effect as IMAGE 1?
 
-In the reference image, observe the bottom of the frame. TWO things are true and BOTH must be matched in the generated image:
-(a) The background fades into a deep BLACK band along the bottom edge of the frame.
-(b) That black band extends UPWARD into the lower portion of the subject — the bottom of the jacket/shirt is partially absorbed into the darkness, with NO sharp visible edge between the subject's clothing and the bottom of the frame. The subject appears to merge into the black at the bottom.
+Notice in IMAGE 1: the bottom of the frame fades into a deep dark band, and that darkness extends UPWARD into the lower portion of the subject — the bottom of the clothing/shoulders is partially absorbed into the darkness, with NO sharp visible edge between the subject and the bottom of the frame.
 
-PASS only if BOTH (a) and (b) are clearly present.
+PASS only if IMAGE 2 has BOTH of these (matching IMAGE 1):
+(a) A deep dark band along the bottom edge of the frame.
+(b) That dark band extends UPWARD into the lower portion of the subject's clothing so the bottom of the jacket/shirt dissolves into the darkness with no hard visible edge.
 
-FAIL if any of these are true:
+FAIL if any of these are true in IMAGE 2:
 - The background is a flat colour with no dark bottom band.
 - Only a corner vignette is present, without a dark bottom band.
 - The bottom of the subject's clothing is fully lit and sits cleanly above a visible edge instead of dissolving into black.
-- The black band exists but does NOT extend up into the subject's clothing (i.e. there's a hard visible edge where the subject ends).
+- A dark band exists but does NOT extend up into the subject's clothing (there's a hard visible edge where the subject ends).
 
-Do NOT evaluate anything else — not the person, not the clothing colour, not the background hue, not the lighting, not the vignette, not headroom, not centering. Bottom-gradient ONLY.
+Do NOT evaluate anything else — not the person, clothing colour, background hue, lighting, vignette, headroom, or centring. Bottom-gradient ONLY.
 
-If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
+If the rule fails, write the fix instruction using direct image comparison. Always phrase the fix this way (template, fill in the bracketed parts):
+"Replicate the bottom-gradient pattern from image 1 (zakir-khan_Comedian.png) in image 2 (the generated image) — currently in image 2 [describe what's wrong in one short phrase, e.g. 'the background is a flat colour' or 'the bottom of the jacket has a hard visible edge']. Add a smooth dark gradient across the bottom of the background AND let that darkness extend upward into the lower portion of the subject's clothing so the bottom of the jacket dissolves into the dark area, exactly as in image 1."
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
     "is_approved": true or false,
-    "things_to_improve": false or "actionable fix instruction if it failed"
+    "things_to_improve": false or "fix instruction following the template above if it failed"
 }"""
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a strict single-criterion bottom-gradient reviewer. Respond only with JSON, no markdown fences."},
+            {"role": "system", "content": "You are a strict single-criterion bottom-gradient reviewer. When instructing fixes, always reference image 1 (zakir-khan_Comedian.png) vs image 2 (the generated image) directly. Respond only with JSON, no markdown fences."},
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
-        max_tokens=300,
+        max_tokens=400,
         temperature=0,
     )
 
@@ -1183,23 +1138,22 @@ Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 def vignette_guardrail(generated_image: bytes) -> dict:
     """
     Single-criterion guardrail: does the generated LinkedIn headshot show a soft
-    radial vignette that darkens the corners relative to the area behind the head?
-    Anchored to the VIGNETTE reference image.
+    radial vignette matching the canonical reference (zakir-khan_Comedian.png)?
 
     Returns {"is_approved": bool, "things_to_improve": str | False}.
     """
     client = get_openai_client()
 
     with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
-        vignette_ref_bytes = f.read()
+        ref_bytes = f.read()
 
     image_content = [
-        {"type": "text", "text": "--- VIGNETTE REFERENCE (the soft radial darkening of the corners is what we want to match) ---"},
+        {"type": "text", "text": "--- IMAGE 1: CANONICAL REFERENCE (zakir-khan_Comedian.png) ---"},
         {
             "type": "image_url",
-            "image_url": {"url": encode_image_for_openai(vignette_ref_bytes, "image/png"), "detail": "high"},
+            "image_url": {"url": encode_image_for_openai(ref_bytes, "image/png"), "detail": "high"},
         },
-        {"type": "text", "text": "--- GENERATED LINKEDIN IMAGE (to evaluate) ---"},
+        {"type": "text", "text": "--- IMAGE 2: GENERATED LINKEDIN IMAGE (to evaluate) ---"},
         {
             "type": "image_url",
             "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
@@ -1209,38 +1163,39 @@ def vignette_guardrail(generated_image: bytes) -> dict:
     prompt = """You are a STRICT vignette reviewer for AI-generated LinkedIn profile headshots.
 
 You are given TWO images:
-1. VIGNETTE REFERENCE — anchors the rule.
-2. The generated LinkedIn image to evaluate.
+- IMAGE 1: the canonical reference (zakir-khan_Comedian.png).
+- IMAGE 2: the generated LinkedIn image to evaluate.
 
-Check ONE thing only: does the generated image have the same soft radial vignette effect as the reference?
+Check ONE thing only: does IMAGE 2 have the same soft radial vignette effect as IMAGE 1?
 
-In the reference image, observe how the area immediately behind/around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker — a clear, smooth radial darkening from the centre outward.
+Notice in IMAGE 1: the area immediately behind/around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker — a clear, smooth radial darkening from the centre outward.
 
-PASS if the corners of the frame in the generated image are clearly darker than the area directly behind the subject's head, with a smooth fade and no visible banding.
+PASS if the corners of the frame in IMAGE 2 are clearly darker than the area directly behind the subject's head, with a smooth fade and no visible banding.
 
-FAIL if any of these are true:
+FAIL if any of these are true in IMAGE 2:
 - The background is a flat colour from edge to edge with no radial darkening.
 - The corners are the same brightness as the centre.
-- The vignette is so heavy or hard-edged that the subject is silhouetted, or a visible black border ring appears.
+- The vignette is so heavy or hard-edged that the subject is silhouetted, or a visible dark border ring appears.
 - The fade has visible banding or hard transitions.
 
-Do NOT evaluate anything else — not the person, not the clothing, not the background colour, not the lighting style, not headroom, not centering, not the bottom gradient. Radial vignette ONLY.
+Do NOT evaluate anything else — not the person, clothing, background colour, lighting style, headroom, centring, or bottom gradient. Radial vignette ONLY.
 
-If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction that can be fed directly back to the image generator to fix it.
+If the rule fails, write the fix instruction using direct image comparison. Always phrase the fix this way (template, fill in the bracketed parts):
+"Replicate the radial vignette pattern from image 1 (zakir-khan_Comedian.png) in image 2 (the generated image) — currently in image 2 [describe what's wrong in one short phrase, e.g. 'the background is uniformly bright from edge to edge' or 'the corners are not noticeably darker than the centre']. Apply a soft, smooth radial darkening so the area behind the head stays the brightest part of the background and the corners and edges fade gradually into noticeably darker tones, matching the gentle vignette in image 1. Avoid a hard mask or a visible dark border."
 
 Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 {
     "is_approved": true or false,
-    "things_to_improve": false or "actionable fix instruction if it failed"
+    "things_to_improve": false or "fix instruction following the template above if it failed"
 }"""
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are a strict single-criterion vignette reviewer. Respond only with JSON, no markdown fences."},
+            {"role": "system", "content": "You are a strict single-criterion vignette reviewer. When instructing fixes, always reference image 1 (zakir-khan_Comedian.png) vs image 2 (the generated image) directly. Respond only with JSON, no markdown fences."},
             {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
         ],
-        max_tokens=300,
+        max_tokens=400,
         temperature=0,
     )
 
