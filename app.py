@@ -1643,19 +1643,20 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.stop()
         status.update(label="Step 1/5 — Input guardrail passed", state="complete")
 
-    # Step 2: profile generation with up to MAX_RETRY attempts.
-    # On each attempt we run FOUR guardrails:
-    #   (a) output_guardrail       — face resemblance / severe artifacts
-    #   (b) headroom_guardrail     — empty band above the head
-    #   (c) bottom_gradient_guardrail — black band fading into the subject's clothing
-    #   (d) vignette_guardrail     — soft radial darkening of the corners
-    # The three single-criterion composition guardrails run sequentially; any
-    # failures are collected and concatenated into one feedback string fed back
-    # to Gemini for the next attempt. After MAX_RETRY attempts, the latest
-    # generated image is accepted as-is.
+    # Step 2: profile generation with THREE independent staged guardrail loops.
+    #
+    # 1) Generate the initial image.
+    # 2) Run output_guardrail (face / artifacts / appropriate) — hard fail aborts.
+    # 3) Stage A — Headroom loop:  up to MAX_RETRY regenerations until headroom passes.
+    # 4) Stage B — Bottom-gradient loop: up to MAX_RETRY regenerations until gradient passes.
+    # 5) Stage C — Vignette loop: up to MAX_RETRY regenerations until vignette passes.
+    #
+    # Each stage independently retries with feedback specific to its own criterion.
+    # If a stage exhausts its retries, the latest image is accepted and we move on.
+    # The base prompt always enforces all rules, so later stages shouldn't normally
+    # regress earlier ones — but if it happens, we accept best-effort.
     generated_image = None
     output_check = None
-    composition_feedback: str | None = None
 
     def _run_single_guardrail(name: str, fn, *args) -> tuple[bool, str | None]:
         """Wrap a guardrail call so a failure inside it doesn't kill the pipeline."""
@@ -1668,69 +1669,72 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         feedback = result.get("things_to_improve") if not passed else None
         return passed, feedback if isinstance(feedback, str) else None
 
-    with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
-        for attempt in range(1, MAX_RETRY + 1):
-            st.write(f"Attempt {attempt}/{MAX_RETRY}...")
-            try:
-                generated_image = generate_linkedin_image(images, composition_feedback, custom_prompt)
-            except Exception as e:
-                st.error(f"Profile generation failed: {e}")
-                st.stop()
-
-            # (a) Face / artifact / appropriateness check — hard fail aborts the run.
-            try:
-                output_check = output_guardrail(generated_image, images)
-            except Exception as e:
-                st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
-                output_check = {"is_approved": True, "things_to_improve": False}
-            if not output_check.get("is_approved"):
-                st.error(f"Profile failed output guardrail: {output_check.get('things_to_improve', 'unknown reason')}")
-                st.stop()
-
-            # (b)(c)(d) Three single-criterion composition guardrails, sequential.
-            failures: list[str] = []
-
-            headroom_pass, headroom_fb = _run_single_guardrail(
-                "Headroom", headroom_guardrail, generated_image
-            )
+    def _run_stage(stage_name: str, guardrail_fn, current_image: bytes) -> bytes:
+        """
+        Run one composition stage with up to MAX_RETRY regenerations.
+        Checks the current image first; only regenerates if the guardrail fails.
+        Returns the final image (passed or best-effort).
+        """
+        nonlocal images, custom_prompt
+        image = current_image
+        for retry in range(1, MAX_RETRY + 1):
+            passed, feedback = _run_single_guardrail(stage_name, guardrail_fn, image)
             st.write(
-                f"  • Headroom guardrail: {'PASS' if headroom_pass else 'FAIL'}"
-                + (f" — {headroom_fb}" if headroom_fb else "")
+                f"  • {stage_name} guardrail (check {retry}/{MAX_RETRY}): "
+                f"{'PASS' if passed else 'FAIL'}"
+                + (f" — {feedback}" if feedback else "")
             )
-            if not headroom_pass and headroom_fb:
-                failures.append(f"Headroom: {headroom_fb}")
-
-            gradient_pass, gradient_fb = _run_single_guardrail(
-                "Bottom gradient", bottom_gradient_guardrail, generated_image
-            )
-            st.write(
-                f"  • Bottom-gradient guardrail: {'PASS' if gradient_pass else 'FAIL'}"
-                + (f" — {gradient_fb}" if gradient_fb else "")
-            )
-            if not gradient_pass and gradient_fb:
-                failures.append(f"Bottom gradient: {gradient_fb}")
-
-            vignette_pass, vignette_fb = _run_single_guardrail(
-                "Vignette", vignette_guardrail, generated_image
-            )
-            st.write(
-                f"  • Vignette guardrail: {'PASS' if vignette_pass else 'FAIL'}"
-                + (f" — {vignette_fb}" if vignette_fb else "")
-            )
-            if not vignette_pass and vignette_fb:
-                failures.append(f"Vignette: {vignette_fb}")
-
-            if not failures:
-                st.write(f"All composition guardrails passed on attempt {attempt}.")
-                break
-
-            improvements = " ".join(failures)
-            st.write(f"Composition guardrails failed on attempt {attempt}: {improvements}")
-            composition_feedback = improvements
-            if attempt == MAX_RETRY:
+            if passed:
+                return image
+            if retry == MAX_RETRY:
                 st.warning(
-                    f"Composition guardrails still failing after {MAX_RETRY} attempts — accepting the latest image as-is."
+                    f"{stage_name} guardrail still failing after {MAX_RETRY} attempts — "
+                    "accepting the latest image as-is and moving on."
                 )
+                return image
+            # Regenerate with this stage's specific feedback for the next check.
+            stage_feedback = feedback or f"{stage_name} composition rule failed."
+            st.write(f"  Regenerating with {stage_name.lower()} feedback...")
+            try:
+                image = generate_linkedin_image(images, stage_feedback, custom_prompt)
+            except Exception as e:
+                st.error(f"{stage_name} retry generation failed: {e}")
+                return image
+        return image
+
+    with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
+        # ── Initial generation ──────────────────────────────────────
+        st.write("Generating initial profile image...")
+        try:
+            generated_image = generate_linkedin_image(images, None, custom_prompt)
+        except Exception as e:
+            st.error(f"Profile generation failed: {e}")
+            st.stop()
+
+        # ── Output guardrail (face / artifacts / appropriate) ───────
+        try:
+            output_check = output_guardrail(generated_image, images)
+        except Exception as e:
+            st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
+            output_check = {"is_approved": True, "things_to_improve": False}
+        if not output_check.get("is_approved"):
+            st.error(
+                f"Profile failed output guardrail: "
+                f"{output_check.get('things_to_improve', 'unknown reason')}"
+            )
+            st.stop()
+
+        # ── Stage A: Headroom (independent retry loop) ──────────────
+        st.write("**Stage A — Headroom check**")
+        generated_image = _run_stage("Headroom", headroom_guardrail, generated_image)
+
+        # ── Stage B: Bottom gradient (independent retry loop) ───────
+        st.write("**Stage B — Bottom-gradient check**")
+        generated_image = _run_stage("Bottom gradient", bottom_gradient_guardrail, generated_image)
+
+        # ── Stage C: Vignette (independent retry loop) ──────────────
+        st.write("**Stage C — Vignette check**")
+        generated_image = _run_stage("Vignette", vignette_guardrail, generated_image)
 
         if generated_image is None:
             st.error("Profile generation failed.")
