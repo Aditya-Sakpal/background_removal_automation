@@ -1674,8 +1674,9 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         Run one composition stage with up to MAX_RETRY regenerations.
         Checks the current image first; only regenerates if the guardrail fails.
         Returns the final image (passed or best-effort).
+
+        Reads `images` and `custom_prompt` from the enclosing module scope.
         """
-        nonlocal images, custom_prompt
         image = current_image
         for retry in range(1, MAX_RETRY + 1):
             passed, feedback = _run_single_guardrail(stage_name, guardrail_fn, image)
