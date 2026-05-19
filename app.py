@@ -37,6 +37,7 @@ HEAD_SPACE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "head_space_
 GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "gradient_reference.jpg")
 COMPOSITION_GOLD_STANDARD_PATH = os.path.join(os.path.dirname(__file__), "netanyahu's image.jpg")
 VIGNETTE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "zakir-khan_Comedian.png")
+BLACK_GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "black_gradient_reference.png")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
 PROFILE_MAX_SIZE_KB = 50
@@ -45,6 +46,7 @@ GALLERY_HEIGHT = 516
 GALLERY_MAX_SIZE_KB = 50
 # Google image pool → OpenAI picks best gallery-style references
 REFERENCE_TOP_K_OPENAI = 10
+EXTRA_GALLERY_BATCH_SIZE = 10  # batch added when user clicks "Fetch 10 more"
 NANO_BANANA_REGEN_MODEL = "gemini-2.5-flash-image"
 
 
@@ -771,7 +773,26 @@ def generate_linkedin_image(
         "elements from this reference should appear in the output."
     )
 
-    # 3. Generation prompt — composition rules + explicit identity anchor.
+    # 3. BLACK BOTTOM GRADIENT reference — additional anchor for rule (b) only.
+    #    May not always exist on every deployment; skip silently if missing.
+    try:
+        black_gradient_ref = Image.open(BLACK_GRADIENT_REFERENCE_PATH).convert("RGB")
+        contents.append(black_gradient_ref)
+        contents.append(
+            "The image above is the BLACK BOTTOM GRADIENT REFERENCE. It exists ONLY "
+            "to show the exact vertical fade pattern at the bottom of the frame — a "
+            "smooth transition from the upper background colour down into a deep "
+            "black band along the bottom edge, where the lower portion of the "
+            "subject's clothing dissolves into the black with no hard visible edge. "
+            "Use this image ONLY for the bottom-gradient pattern (rule (b)). "
+            "DO NOT copy any person, clothing, face, or unrelated visual element "
+            "from this image — and DO NOT copy its overall colour palette beyond "
+            "the bottom-fade-to-black effect."
+        )
+    except FileNotFoundError:
+        pass
+
+    # 4. Generation prompt — composition rules + explicit identity anchor.
     prompt_text = """Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the canonical composition reference (last image).
 
 IDENTITY (read this first — most common failure mode):
@@ -1842,6 +1863,7 @@ if st.session_state.pipeline_phase == "running_gallery" and st.session_state.pip
     # Step 5: regenerate top 10 (serial, no retry)
     gallery_outputs: list[tuple[str, bytes, bool]] = []
     with st.status("Step 5 — Regenerating final 10 gallery images...", expanded=True):
+        used_urls_initial: set[str] = set()
         progress = st.progress(0, text=f"Processing 0/{REFERENCE_TOP_K_OPENAI}")
         for j, pool_idx in enumerate(top_indices, start=1):
             if pool_idx < 0 or pool_idx >= len(rows):
@@ -1861,6 +1883,11 @@ if st.session_state.pipeline_phase == "running_gallery" and st.session_state.pip
                 st.error(f"Gallery {j} failed: WebP export failed.")
                 st.stop()
             gallery_outputs.append((f"gallery{j}.webp", webp_b, ok))
+            # Capture the source URL so a follow-up "Fetch 10 more" batch
+            # can de-duplicate against what we already used.
+            row_link = rows[pool_idx].get("link") or ""
+            if row_link:
+                used_urls_initial.add(row_link)
             progress.progress(
                 int((j / REFERENCE_TOP_K_OPENAI) * 100),
                 text=f"Processing {j}/{REFERENCE_TOP_K_OPENAI}",
@@ -1887,9 +1914,13 @@ if st.session_state.pipeline_phase == "running_gallery" and st.session_state.pip
         "artist_folder": artist_folder,
     }
 
-    # Release intermediate state — final output is now in result_data + zip.
+    # Release the heavy SerpApi pool; keep pipeline_inputs around so the user
+    # can click "Fetch 10 more gallery images" later without re-entering inputs.
+    # (pipeline_inputs is small — just the artist name, slug, api key, and
+    # cached uploaded image bytes — kilobytes, not megabytes.)
     st.session_state.reference_pool_rows = None
-    st.session_state.pipeline_inputs = None
+    # Track URLs already used so the "Fetch 10 more" button skips duplicates.
+    st.session_state.used_gallery_urls = used_urls_initial
     st.session_state.pipeline_phase = "done"
     rows = None
     serp_candidates = None
@@ -1927,3 +1958,169 @@ if result_data:
         mime="application/zip",
         use_container_width=True,
     )
+
+    # ── Fetch 10 more gallery images ─────────────────────────────────────────
+    # Runs the same SerpApi → OpenAI rerank → Nano Banana banner pipeline on a
+    # fresh batch and appends the new images to result_data.gallery_outputs.
+    # Available only when pipeline_inputs is still cached (i.e. didn't reset).
+    st.divider()
+    if st.session_state.pipeline_inputs is None:
+        st.caption(
+            "Inputs were cleared. To fetch more gallery images, regenerate the profile first."
+        )
+    else:
+        already_count = len(gallery_outputs)
+        if st.button(
+            f"Fetch {EXTRA_GALLERY_BATCH_SIZE} more gallery images",
+            type="secondary",
+            use_container_width=True,
+            key="btn_fetch_more_gallery",
+        ):
+            inputs = st.session_state.pipeline_inputs
+            artist_name_resolved = inputs["artist_name"]
+            api_key = inputs["api_key"]
+            already_used: set[str] = set(st.session_state.get("used_gallery_urls") or [])
+            extra_new_outputs: list[tuple[str, bytes, bool]] = []
+
+            # Step 3 (extra) — fetch a fresh SerpApi pool
+            with st.status(
+                f"Fetching {REFERENCE_IMAGE_POOL_SIZE} more references from SerpApi...",
+                expanded=False,
+            ) as status:
+                try:
+                    extra_candidates = fetch_serpapi_image_candidates(
+                        artist_name_resolved,
+                        api_key,
+                        target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
+                        target_count=REFERENCE_IMAGE_POOL_SIZE,
+                    )
+                except Exception as e:
+                    st.error(f"SerpApi fetch failed: {e}")
+                    st.stop()
+                extra_rows: list[dict] = []
+                for pool_idx, c in enumerate(extra_candidates):
+                    link = c.get("link") or ""
+                    # Skip URLs already used in the initial batch.
+                    if link and link in already_used:
+                        continue
+                    data = None
+                    for url in (c.get("link"), c.get("thumbnail_link")):
+                        if not url:
+                            continue
+                        try:
+                            cand_bytes = download_image_bytes(url)
+                            ok, _ = is_valid_image_bytes(cand_bytes) if cand_bytes else (False, "No data")
+                            if cand_bytes and len(cand_bytes) > 500 and ok:
+                                data = _downscale_for_pool(cand_bytes)
+                                break
+                        except Exception:
+                            data = None
+                    extra_rows.append({
+                        "pool_idx": pool_idx,
+                        "index": pool_idx + 1,
+                        "title": c.get("title", ""),
+                        "link": link,
+                        "width": c.get("width"),
+                        "height": c.get("height"),
+                        "aspect_ratio": c.get("aspect_ratio"),
+                        "bytes": data,
+                    })
+                if not extra_rows:
+                    st.error("No additional references found (all were duplicates of the first batch).")
+                    st.stop()
+                status.update(
+                    label=f"Fetched {len(extra_rows)} additional references from SerpApi",
+                    state="complete",
+                )
+
+            # Step 4 (extra) — rank top N via OpenAI
+            with st.status(
+                f"Ranking top {EXTRA_GALLERY_BATCH_SIZE} of the new references...",
+                expanded=False,
+            ) as status:
+                try:
+                    extra_top_indices, extra_rank_err = rank_reference_images_openai(
+                        extra_rows,
+                        artist_name_resolved,
+                        GALLERY_WIDTH / GALLERY_HEIGHT,
+                        top_k=EXTRA_GALLERY_BATCH_SIZE,
+                    )
+                except Exception as e:
+                    st.error(f"Ranking failed: {e}")
+                    st.stop()
+                if extra_rank_err:
+                    st.warning(extra_rank_err)
+                if not extra_top_indices:
+                    st.error("Ranker returned no usable images.")
+                    st.stop()
+                # Free non-selected payloads.
+                top_set_extra = set(extra_top_indices)
+                for i, row in enumerate(extra_rows):
+                    if i not in top_set_extra:
+                        row["bytes"] = None
+                gc.collect()
+                status.update(
+                    label=f"Selected {len(extra_top_indices)} additional references",
+                    state="complete",
+                )
+
+            # Step 5 (extra) — regenerate banners
+            with st.status("Regenerating additional gallery banners...", expanded=True):
+                progress = st.progress(0, text=f"Processing 0/{len(extra_top_indices)}")
+                next_name_start = already_count + 1
+                for j, pool_idx in enumerate(extra_top_indices, start=1):
+                    if pool_idx < 0 or pool_idx >= len(extra_rows):
+                        st.warning(f"Extra gallery {j} skipped: invalid index.")
+                        continue
+                    src = extra_rows[pool_idx].get("bytes")
+                    if not src:
+                        st.warning(f"Extra gallery {j} skipped: missing source bytes.")
+                        continue
+                    try:
+                        png_banner = regenerate_gallery_image_nano_banana(src)
+                        webp_b, ok = prepare_gallery_webp(png_banner)
+                    except Exception as ex:
+                        st.warning(f"Extra gallery {j} failed: {ex}")
+                        continue
+                    if not webp_b:
+                        st.warning(f"Extra gallery {j} skipped: WebP export failed.")
+                        continue
+                    fname = f"gallery{next_name_start + len(extra_new_outputs)}.webp"
+                    extra_new_outputs.append((fname, webp_b, ok))
+                    link = extra_rows[pool_idx].get("link") or ""
+                    if link:
+                        already_used.add(link)
+                    progress.progress(
+                        int((j / len(extra_top_indices)) * 100),
+                        text=f"Processing {j}/{len(extra_top_indices)}",
+                    )
+                    extra_rows[pool_idx]["bytes"] = None
+                    del png_banner, src
+                    gc.collect()
+
+            if not extra_new_outputs:
+                st.error("No additional gallery images were produced.")
+                st.stop()
+
+            # Merge into result_data and rebuild ZIP.
+            merged_outputs = list(gallery_outputs) + extra_new_outputs
+            new_zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(new_zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"{artist_folder}/profile.webp", profile_webp_bytes)
+                for name, data, _ in merged_outputs:
+                    zf.writestr(f"{artist_folder}/{name}", data)
+
+            st.session_state.result_data = {
+                **result_data,
+                "gallery_outputs": merged_outputs,
+                "zip_bytes": new_zip_buffer.getvalue(),
+            }
+            st.session_state.used_gallery_urls = already_used
+
+            extra_rows = None
+            extra_candidates = None
+            gc.collect()
+            st.success(
+                f"Added {len(extra_new_outputs)} new gallery image(s). Total now: {len(merged_outputs)}."
+            )
+            st.rerun()
