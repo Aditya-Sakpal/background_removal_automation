@@ -1332,6 +1332,13 @@ if "reference_rank_note" not in st.session_state:
     st.session_state.reference_rank_note = None
 if "reference_regenerated" not in st.session_state:
     st.session_state.reference_regenerated = None
+# Profile-selection phase state — 3-candidate flow.
+if "pipeline_phase" not in st.session_state:
+    st.session_state.pipeline_phase = "idle"  # idle | awaiting_selection | running_gallery | done
+if "profile_candidates" not in st.session_state:
+    st.session_state.profile_candidates = None  # list[bytes] of 3 PNGs
+if "pipeline_inputs" not in st.session_state:
+    st.session_state.pipeline_inputs = None  # cached form inputs across reruns
 
 # ---- Google Images API: reference pool (gallery aspect) ----
 st.divider()
@@ -1596,8 +1603,19 @@ if uploaded_files:
             except Exception as e:
                 st.warning(f"Cannot preview {f.name}: {e}")
 
+NUM_PROFILE_CANDIDATES = 3
+
+# =====================================================================
+# PHASE 1 — User clicks "Generate Image".
+# Validate inputs, run input guardrail, generate 3 profile candidates
+# (no output/composition guardrails — the user chooses the best one).
+# =====================================================================
 if st.button("Generate Image", type="primary", use_container_width=True):
+    # Reset any prior run.
     st.session_state.result_data = None
+    st.session_state.profile_candidates = None
+    st.session_state.pipeline_inputs = None
+    st.session_state.pipeline_phase = "idle"
 
     if not artist_name.strip():
         st.error("Please enter an artist name.")
@@ -1622,151 +1640,133 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         f.seek(0)
         images.append((f.read(), mime_from_name(f.name)))
 
-    # Step 1: input check
-    with st.status("Step 1/5 — Input quality check...", expanded=True) as status:
+    # Step 1: input check (lightweight quality gate on the uploads).
+    with st.status("Step 1 — Input quality check...", expanded=True) as status:
         try:
             input_check = input_guardrail(images)
         except Exception as e:
             st.error(f"Input guardrail failed: {e}")
             st.stop()
         if not input_check.get("is_approved"):
-            status.update(label="Step 1/5 — Input guardrail failed", state="error")
+            status.update(label="Step 1 — Input guardrail failed", state="error")
             st.error("Some uploaded images failed quality checks.")
             for issue in input_check.get("issues", []):
                 idx = issue.get("image_index", "?")
                 problems = issue.get("problems", [])
-                file_name = uploaded_files[idx].name if isinstance(idx, int) and idx < len(uploaded_files) else f"Image {idx}"
+                file_name = (
+                    uploaded_files[idx].name
+                    if isinstance(idx, int) and idx < len(uploaded_files)
+                    else f"Image {idx}"
+                )
                 for p in problems:
                     st.write(f"- **{file_name}**: {p}")
             st.stop()
-        status.update(label="Step 1/5 — Input guardrail passed", state="complete")
+        status.update(label="Step 1 — Input guardrail passed", state="complete")
 
-    # Step 2: profile generation with THREE independent staged guardrail loops.
-    #
-    # 1) Generate the initial image.
-    # 2) Run output_guardrail (face / artifacts / appropriate) — hard fail aborts.
-    # 3) Stage A — Headroom loop:  up to MAX_RETRY regenerations until headroom passes.
-    # 4) Stage B — Bottom-gradient loop: up to MAX_RETRY regenerations until gradient passes.
-    # 5) Stage C — Vignette loop: up to MAX_RETRY regenerations until vignette passes.
-    #
-    # Each stage independently retries with feedback specific to its own criterion.
-    # If a stage exhausts its retries, the latest image is accepted and we move on.
-    # The base prompt always enforces all rules, so later stages shouldn't normally
-    # regress earlier ones — but if it happens, we accept best-effort.
-    generated_image = None
-    output_check = None
+    # Step 2: generate N profile candidates (no guardrails — user picks).
+    profile_candidates: list[bytes] = []
+    with st.status(
+        f"Step 2 — Generating {NUM_PROFILE_CANDIDATES} profile candidates...",
+        expanded=True,
+    ) as status:
+        for i in range(1, NUM_PROFILE_CANDIDATES + 1):
+            st.write(f"Generating candidate {i}/{NUM_PROFILE_CANDIDATES}...")
+            try:
+                img = generate_linkedin_image(images, None, custom_prompt)
+                profile_candidates.append(img)
+            except Exception as e:
+                st.warning(f"Candidate {i} generation failed: {e}")
+        if not profile_candidates:
+            status.update(
+                label=f"Step 2 — All {NUM_PROFILE_CANDIDATES} candidate generations failed",
+                state="error",
+            )
+            st.error("All profile candidate generations failed. Try again.")
+            st.stop()
+        status.update(
+            label=f"Step 2 — Generated {len(profile_candidates)}/{NUM_PROFILE_CANDIDATES} candidates",
+            state="complete",
+        )
 
-    def _run_single_guardrail(name: str, fn, *args) -> tuple[bool, str | None]:
-        """Wrap a guardrail call so a failure inside it doesn't kill the pipeline."""
-        try:
-            result = fn(*args)
-        except Exception as e:
-            st.warning(f"{name} guardrail errored ({e}) — treating as passed.")
-            return True, None
-        passed = bool(result.get("is_approved"))
-        feedback = result.get("things_to_improve") if not passed else None
-        return passed, feedback if isinstance(feedback, str) else None
+    # Cache inputs + candidates for the next rerun, then move to selection phase.
+    st.session_state.profile_candidates = profile_candidates
+    st.session_state.pipeline_inputs = {
+        "images": images,
+        "artist_name": artist_name.strip(),
+        "artist_folder": artist_folder,
+        "custom_prompt": custom_prompt,
+        "api_key": api_key,
+    }
+    st.session_state.pipeline_phase = "awaiting_selection"
+    st.rerun()
 
-    def _show_debug_image(label: str, image_bytes: bytes) -> None:
-        """Render an image inline with its dimensions for debugging."""
-        try:
-            pil = Image.open(io.BytesIO(image_bytes))
-            w, h = pil.size
+
+# =====================================================================
+# PHASE 2 — Candidate selection.
+# Show all generated profile candidates and let the user pick one.
+# =====================================================================
+if (
+    st.session_state.pipeline_phase == "awaiting_selection"
+    and st.session_state.profile_candidates
+):
+    st.divider()
+    st.subheader("Pick your profile image")
+    st.caption(
+        f"Generated {len(st.session_state.profile_candidates)} candidate profile images. "
+        "Choose the one you like best — it will be used as the profile.webp and as the "
+        "face anchor for the gallery."
+    )
+
+    candidates = st.session_state.profile_candidates
+    cols = st.columns(len(candidates))
+    for i, img_bytes in enumerate(candidates):
+        with cols[i]:
             st.image(
-                pil,
-                caption=f"{label} — {w}×{h}px",
+                Image.open(io.BytesIO(img_bytes)),
+                caption=f"Candidate {i + 1}",
                 use_container_width=True,
             )
-        except Exception as e:
-            st.write(f"_(could not render {label}: {e})_")
 
-    def _run_stage(stage_name: str, guardrail_fn, current_image: bytes) -> bytes:
-        """
-        Run one composition stage with up to MAX_RETRY regenerations.
-        Checks the current image first; only regenerates if the guardrail fails.
-        Returns the final image (passed or best-effort).
+    selected_index = st.radio(
+        "Select a candidate",
+        options=list(range(len(candidates))),
+        format_func=lambda i: f"Candidate {i + 1}",
+        horizontal=True,
+        key="profile_candidate_selection",
+    )
 
-        Reads `images` and `custom_prompt` from the enclosing module scope.
-        """
-        image = current_image
-        for retry in range(1, MAX_RETRY + 1):
-            st.markdown(f"**{stage_name} — check {retry}/{MAX_RETRY}**")
-            _show_debug_image(f"{stage_name} attempt {retry}", image)
-            passed, feedback = _run_single_guardrail(stage_name, guardrail_fn, image)
-            verdict = "✅ PASS" if passed else "❌ FAIL"
-            st.write(
-                f"  • {stage_name} guardrail verdict: {verdict}"
-                + (f" — {feedback}" if feedback else "")
-            )
-            if passed:
-                return image
-            if retry == MAX_RETRY:
-                st.warning(
-                    f"{stage_name} guardrail still failing after {MAX_RETRY} attempts — "
-                    "accepting the latest image as-is and moving on."
-                )
-                return image
-            # Regenerate with this stage's specific feedback for the next check.
-            stage_feedback = feedback or f"{stage_name} composition rule failed."
-            with st.expander(f"Feedback sent to Gemini for {stage_name.lower()} retry"):
-                st.code(stage_feedback)
-            st.write(f"  Regenerating with {stage_name.lower()} feedback...")
-            try:
-                image = generate_linkedin_image(images, stage_feedback, custom_prompt)
-            except Exception as e:
-                st.error(f"{stage_name} retry generation failed: {e}")
-                return image
-        return image
+    if st.button("Continue with this profile", type="primary", use_container_width=True):
+        st.session_state.pipeline_inputs["selected_profile_image"] = candidates[selected_index]
+        st.session_state.pipeline_phase = "running_gallery"
+        # Free the unselected candidates to keep memory bounded.
+        st.session_state.profile_candidates = None
+        gc.collect()
+        st.rerun()
 
-    with st.status("Step 2/5 — Generating profile image...", expanded=True) as status:
-        # ── Initial generation ──────────────────────────────────────
-        st.write("Generating initial profile image...")
-        try:
-            generated_image = generate_linkedin_image(images, None, custom_prompt)
-        except Exception as e:
-            st.error(f"Profile generation failed: {e}")
-            st.stop()
 
-        # ── Output guardrail (face / artifacts / appropriate) ───────
-        try:
-            output_check = output_guardrail(generated_image, images)
-        except Exception as e:
-            st.warning(f"Output guardrail errored ({e}) — treating profile as approved.")
-            output_check = {"is_approved": True, "things_to_improve": False}
-        if not output_check.get("is_approved"):
-            st.error(
-                f"Profile failed output guardrail: "
-                f"{output_check.get('things_to_improve', 'unknown reason')}"
-            )
-            st.stop()
-
-        # ── Stage A: Headroom (independent retry loop) ──────────────
-        st.write("**Stage A — Headroom check**")
-        generated_image = _run_stage("Headroom", headroom_guardrail, generated_image)
-
-        # ── Stage B: Bottom gradient (independent retry loop) ───────
-        st.write("**Stage B — Bottom-gradient check**")
-        generated_image = _run_stage("Bottom gradient", bottom_gradient_guardrail, generated_image)
-
-        # ── Stage C: Vignette (independent retry loop) ──────────────
-        st.write("**Stage C — Vignette check**")
-        generated_image = _run_stage("Vignette", vignette_guardrail, generated_image)
-
-        if generated_image is None:
-            st.error("Profile generation failed.")
-            st.stop()
-        status.update(label="Step 2/5 — Profile approved", state="complete")
+# =====================================================================
+# PHASE 3 — Gallery pipeline (Steps 3-5) using the selected profile.
+# =====================================================================
+if st.session_state.pipeline_phase == "running_gallery" and st.session_state.pipeline_inputs:
+    inputs = st.session_state.pipeline_inputs
+    images = inputs["images"]
+    artist_name_resolved = inputs["artist_name"]
+    artist_folder = inputs["artist_folder"]
+    custom_prompt = inputs["custom_prompt"]
+    api_key = inputs["api_key"]
+    generated_image = inputs["selected_profile_image"]
 
     profile_webp_bytes, profile_within_limit = prepare_profile_webp(generated_image)
     if not profile_webp_bytes:
         st.error("Failed to prepare profile.webp.")
+        st.session_state.pipeline_phase = "idle"
         st.stop()
 
     # Step 3: fetch SerpApi pool
-    with st.status("Step 3/5 — Fetching gallery references from SerpApi...", expanded=False) as status:
+    with st.status("Step 3 — Fetching gallery references from SerpApi...", expanded=False) as status:
         try:
-            candidates = fetch_serpapi_image_candidates(
-                artist_name.strip(),
+            serp_candidates = fetch_serpapi_image_candidates(
+                artist_name_resolved,
                 api_key,
                 target_aspect=GALLERY_WIDTH / GALLERY_HEIGHT,
                 target_count=REFERENCE_IMAGE_POOL_SIZE,
@@ -1775,17 +1775,17 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.error(f"SerpApi fetch failed: {e}")
             st.stop()
         rows: list[dict] = []
-        for pool_idx, c in enumerate(candidates):
+        for pool_idx, c in enumerate(serp_candidates):
             data = None
             err = None
             for url in (c.get("link"), c.get("thumbnail_link")):
                 if not url:
                     continue
                 try:
-                    candidate = download_image_bytes(url)
-                    ok, decode_err = is_valid_image_bytes(candidate) if candidate else (False, "No data")
-                    if candidate and len(candidate) > 500 and ok:
-                        data = _downscale_for_pool(candidate)
+                    cand_bytes = download_image_bytes(url)
+                    ok, decode_err = is_valid_image_bytes(cand_bytes) if cand_bytes else (False, "No data")
+                    if cand_bytes and len(cand_bytes) > 500 and ok:
+                        data = _downscale_for_pool(cand_bytes)
                         break
                     err = decode_err or "Downloaded bytes are not a valid image"
                 except Exception as ex:
@@ -1807,15 +1807,15 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         if not rows:
             st.error("No gallery references found from SerpApi.")
             st.stop()
-        status.update(label="Step 3/5 — SerpApi references fetched", state="complete")
+        status.update(label="Step 3 — SerpApi references fetched", state="complete")
 
     # Step 4: rank top 10
-    with st.status("Step 4/5 — Ranking top 10 gallery references...", expanded=False) as status:
+    with st.status("Step 4 — Ranking top 10 gallery references...", expanded=False) as status:
         ta = GALLERY_WIDTH / GALLERY_HEIGHT
         try:
             top_indices, rank_err = rank_reference_images_openai(
                 rows,
-                artist_name.strip(),
+                artist_name_resolved,
                 ta,
                 top_k=REFERENCE_TOP_K_OPENAI,
             )
@@ -1825,7 +1825,9 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         if rank_err:
             st.warning(rank_err)
         if len(top_indices) < REFERENCE_TOP_K_OPENAI:
-            st.error(f"Ranking produced only {len(top_indices)} images; expected {REFERENCE_TOP_K_OPENAI}.")
+            st.error(
+                f"Ranking produced only {len(top_indices)} images; expected {REFERENCE_TOP_K_OPENAI}."
+            )
             st.stop()
 
         # Free non-selected image payloads — they account for ~half of pool memory.
@@ -1835,11 +1837,11 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 row["bytes"] = None
         gc.collect()
 
-        status.update(label="Step 4/5 — Top 10 selected", state="complete")
+        status.update(label="Step 4 — Top 10 selected", state="complete")
 
     # Step 5: regenerate top 10 (serial, no retry)
     gallery_outputs: list[tuple[str, bytes, bool]] = []
-    with st.status("Step 5/5 — Regenerating final 10 gallery images...", expanded=True):
+    with st.status("Step 5 — Regenerating final 10 gallery images...", expanded=True):
         progress = st.progress(0, text=f"Processing 0/{REFERENCE_TOP_K_OPENAI}")
         for j, pool_idx in enumerate(top_indices, start=1):
             if pool_idx < 0 or pool_idx >= len(rows):
@@ -1859,10 +1861,13 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 st.error(f"Gallery {j} failed: WebP export failed.")
                 st.stop()
             gallery_outputs.append((f"gallery{j}.webp", webp_b, ok))
-            progress.progress(int((j / REFERENCE_TOP_K_OPENAI) * 100), text=f"Processing {j}/{REFERENCE_TOP_K_OPENAI}")
+            progress.progress(
+                int((j / REFERENCE_TOP_K_OPENAI) * 100),
+                text=f"Processing {j}/{REFERENCE_TOP_K_OPENAI}",
+            )
 
-            # Free the processed source + any transient PIL/numpy objects before
-            # the next iteration so peak memory stays bounded.
+            # Free the processed source + transient PIL/numpy objects before the
+            # next iteration so peak memory stays bounded.
             rows[pool_idx]["bytes"] = None
             del png_banner, src
             gc.collect()
@@ -1882,12 +1887,14 @@ if st.button("Generate Image", type="primary", use_container_width=True):
         "artist_folder": artist_folder,
     }
 
-    # Release the pool + rows so Streamlit doesn't hold onto raw image bytes
-    # across reruns. Final output is now fully in result_data + the zip buffer.
+    # Release intermediate state — final output is now in result_data + zip.
     st.session_state.reference_pool_rows = None
+    st.session_state.pipeline_inputs = None
+    st.session_state.pipeline_phase = "done"
     rows = None
-    candidates = None
+    serp_candidates = None
     gc.collect()
+    st.rerun()
 
 result_data = st.session_state.result_data
 if result_data:
