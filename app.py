@@ -739,39 +739,51 @@ def generate_linkedin_image(
     composition_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
     contents.append(composition_ref)
     contents.append(
-        "The LAST image above is the CANONICAL COMPOSITION REFERENCE. It exists "
-        "ONLY to show you the COMPOSITION PATTERN — framing, headroom, gradient, "
-        "and vignette. Read this carefully:\n"
+        "The LAST image above is the CANONICAL COMPOSITION REFERENCE. It is a photo "
+        "of the Indian stand-up comedian ZAKIR KHAN. Zakir Khan is NOT the subject "
+        "of this generation — he is shown ONLY as inspiration for the COMPOSITION "
+        "PATTERN (framing, headroom, gradient, vignette). Read this carefully:\n"
         "\n"
-        "  ⚠ THE PERSON IN THIS REFERENCE IS NOT THE SUBJECT. ⚠\n"
+        "  ⚠ ZAKIR KHAN IS NOT THE SUBJECT. ⚠\n"
+        "  ⚠ DO NOT GENERATE ZAKIR KHAN IN THE OUTPUT. ⚠\n"
+        "  ⚠ THE SUBJECT IS THE PERSON IN THE SUBJECT PHOTOS ABOVE — NOT ZAKIR KHAN. ⚠\n"
         "\n"
-        "Treat this reference as if the person inside it were invisible — you are "
-        "looking at it purely for the LAYOUT (where the head sits in the frame, "
-        "how the background fades into the clothing, how the corners are darker, "
-        "where the subject is positioned horizontally). The IDENTITY of the person "
-        "in the output comes ONLY from the SUBJECT PHOTOS above.\n"
+        "Treat Zakir Khan's body, face, hair, beard, ethnicity, expression, pose, "
+        "blazer, and clothing as if they were invisible. You are looking at this "
+        "image purely for the LAYOUT (where the head sits in the frame, how the "
+        "background fades into the clothing, how the corners are darker, where the "
+        "subject is positioned horizontally). The IDENTITY of the person in the "
+        "output comes ONLY from the SUBJECT PHOTOS above — never from Zakir Khan.\n"
         "\n"
         "Specifically, the FOUR composition features you must replicate from this "
         "reference are:\n"
-        "  (a) SUBJECT SIZE / HEADROOM — notice how small the subject is relative "
-        "to the frame: a generous band of empty background sits above the top of "
-        "the hair, occupying roughly the upper 20-25% of the frame. The subject is "
-        "framed from a wider distance — head and shoulders take only the lower "
-        "portion of the image, never filling it from edge to edge.\n"
+        "  (a) SUBJECT SIZE / HEADROOM — notice how small Zakir Khan is relative to "
+        "the frame: a generous band of empty background sits above the top of his "
+        "hair, occupying roughly the upper 20-25% of the frame. The subject in your "
+        "output should be framed from a similar wider distance — head and shoulders "
+        "take only the lower portion of the image, never filling it from edge to edge.\n"
         "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep "
         "dark band along the bottom edge, and that dark band extends UPWARD into "
-        "the lower portion of the subject's clothing so the bottom of the jacket "
-        "dissolves into darkness with no sharp visible edge.\n"
-        "  (c) HORIZONTAL CENTRING — the subject sits roughly centred with similar "
-        "amounts of background on the left and the right.\n"
-        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around the head "
-        "is the brightest part of the background; the corners and edges are "
-        "noticeably darker in a smooth radial fade (no hard mask, no heavy border).\n"
+        "the lower portion of Zakir Khan's clothing so the bottom of the blazer "
+        "dissolves into darkness with no sharp visible edge. Replicate this same "
+        "blend on your subject's clothing.\n"
+        "  (c) HORIZONTAL CENTRING — Zakir Khan sits roughly centred in the frame "
+        "with similar amounts of background on the left and the right. Centre your "
+        "subject the same way.\n"
+        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around Zakir "
+        "Khan's head is the brightest part of the background; the corners and "
+        "edges are noticeably darker in a smooth radial fade (no hard mask, no "
+        "heavy border). Replicate the same vignette behind your subject's head.\n"
         "\n"
-        "FORBIDDEN: copying the person from this reference, copying their face, "
-        "facial hair, hair style, ethnicity, age, gender, expression, pose, "
-        "clothing colour, blazer, microphone, or background hue. None of these "
-        "elements from this reference should appear in the output."
+        "FORBIDDEN — none of these from Zakir Khan should appear in your output:\n"
+        "  • Zakir Khan's face, beard, eyes, nose, lips, or jawline.\n"
+        "  • Zakir Khan's hair style or hair colour.\n"
+        "  • Zakir Khan's ethnicity, age, gender expression, or body type.\n"
+        "  • Zakir Khan's pose, hand gestures, or microphone.\n"
+        "  • Zakir Khan's blazer, shirt, or any of his clothing.\n"
+        "  • The maroon/red/dark background hue (use a colour that complements YOUR "
+        "subject's clothing instead).\n"
+        "If the output looks like Zakir Khan in any way, you have made a mistake."
     )
 
     # 3. BLACK BOTTOM GRADIENT reference — additional anchor for rule (b) only.
@@ -794,13 +806,27 @@ def generate_linkedin_image(
         pass
 
     # 4. Generation prompt — composition rules + explicit identity anchor.
-    prompt_text = """Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the canonical composition reference (last image).
+    prompt_text = """🚨 PRIMARY INSTRUCTION (READ FIRST, OVERRIDES EVERYTHING ELSE) 🚨
+
+The last image in this input is a photo of ZAKIR KHAN (an Indian stand-up comedian). His image is provided STRICTLY AS A REFERENCE for the COMPOSITION ONLY. He is there for inspiration on how the layout / framing / background should look — that is the ONLY thing you should take from his image.
+
+➤ DO NOT ADD ZAKIR KHAN IN THE IMAGE YOU'LL BE GENERATING.
+➤ DO NOT make the subject look like Zakir Khan in any way.
+➤ DO NOT borrow Zakir Khan's face, beard, hair, ethnicity, expression, pose, hand gestures, microphone, or clothing.
+➤ The person in your output must be the person from the SUBJECT PHOTOS (the first images in the input) — a DIFFERENT individual from Zakir Khan.
+
+If your output contains anyone who resembles Zakir Khan, the generation is wrong and must be redone.
+
+────────────────────────────────────────────────────────────
+
+Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the composition layout from the Zakir Khan reference (last image), but with YOUR subject (not Zakir Khan) as the person in the frame.
 
 IDENTITY (read this first — most common failure mode):
 - The face, skin tone, hair, facial hair, ethnicity, age, gender, and overall identity in the output MUST come from the SUBJECT PHOTOS — the first images in the input. NOT from the composition reference.
-- The composition reference (last image) shows a DIFFERENT PERSON who is NOT the subject. Their face, expression, blazer, microphone, and ethnicity are decoys — look past them.
-- If you find yourself producing an output that looks more like the person in the composition reference than the person in the subject photos, you have made a mistake. Start over.
-- One sanity check: would the person in the subject photos recognise themselves in your output? If not, the identity is wrong.
+- The composition reference (last image) is a photo of ZAKIR KHAN, an Indian stand-up comedian. Zakir Khan is provided ONLY as a layout/composition example. ZAKIR KHAN IS NOT THE SUBJECT. DO NOT generate Zakir Khan in your output. DO NOT copy his face, beard, hair, ethnicity, expression, blazer, hand pose, microphone, or any visual element of his.
+- The subject of this generation is the person shown in the SUBJECT PHOTOS at the start of the input — a completely different individual from Zakir Khan.
+- If your output ends up looking like Zakir Khan rather than the person in the subject photos, you have made a critical mistake. Start over with the subject photos as the identity source.
+- Sanity check before finishing: cover the body in your output and look at only the face. Does that face match the person in the subject photos? If it instead matches Zakir Khan from the composition reference, regenerate.
 
 TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING (most important rule):
 - Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame. The subject's head + shoulders should occupy only the LOWER PORTION of the image, NOT fill the entire frame from top to bottom.
