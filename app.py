@@ -204,6 +204,7 @@ def call_gemini_with_retry(
     context: str,
     max_attempts: int = 3,
 ) -> bytes:
+    
     """
     Call generate_content and parse the image, retrying on transient errors
     (IMAGE_OTHER, OTHER, MAX_TOKENS). Hard failures (safety, prompt block)
