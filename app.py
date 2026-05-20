@@ -1881,10 +1881,11 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.stop()
         status.update(label="Step 1 — Input guardrail passed", state="complete")
 
-    # Step 2: generate ONE profile image and loop through FOUR strict guardrails
-    # with NO retry cap. Each guardrail failure triggers a regeneration with
-    # that guardrail's specific feedback, then the loop restarts from G1.
-    # Only when all four pass in a single pass do we accept the image.
+    # Step 2: generate ONE profile image and loop through FOUR strict guardrails.
+    # Each guardrail failure triggers a regeneration with that guardrail's
+    # specific feedback, then the loop restarts from G1. Loop is capped at
+    # MAX_STRICT_ITERATIONS — when the cap is hit, the latest image is accepted
+    # as best-effort.
     #
     # G1 — Zakir Khan identity check (the generated person must NOT be Zakir Khan)
     # G2 — Headroom / subject size check
@@ -1892,7 +1893,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
     # G4 — Black bottom gradient check
     #
     # Each iteration costs ~1 Gemini call + up to 4 OpenAI vision calls.
-    # No iteration limit by design — refresh the page to abort.
+    MAX_STRICT_ITERATIONS = 3
     GUARDRAILS_IN_ORDER = [
         ("G1: Zakir Khan identity",     zakir_khan_identity_guardrail),
         ("G2: Headroom",                headroom_guardrail),
@@ -1916,7 +1917,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
     final_status = None  # "all_passed" or "stopped"
 
     with st.status(
-        "Step 2 — Strict guardrail loop (no retry limit)...",
+        f"Step 2 — Strict guardrail loop (max {MAX_STRICT_ITERATIONS} iterations)...",
         expanded=True,
     ) as status:
         st.write("Generating initial profile image...")
@@ -1927,9 +1928,9 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.error(f"Initial profile generation failed: {e}")
             st.stop()
 
-        while True:
+        while iteration < MAX_STRICT_ITERATIONS:
             iteration += 1
-            st.markdown(f"### Iteration {iteration}")
+            st.markdown(f"### Iteration {iteration}/{MAX_STRICT_ITERATIONS}")
 
             try:
                 preview_pil = Image.open(io.BytesIO(generated_image))
@@ -1964,6 +1965,16 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 final_status = "all_passed"
                 break
 
+            # If we already used the last allowed iteration, accept as best-effort.
+            if iteration >= MAX_STRICT_ITERATIONS:
+                st.warning(
+                    f"Reached max iterations ({MAX_STRICT_ITERATIONS}) — "
+                    f"last failing guardrail was {failed_guardrail}. "
+                    "Accepting the latest image as best-effort and continuing."
+                )
+                final_status = "max_iterations"
+                break
+
             # Regenerate with that guardrail's feedback and restart the loop.
             st.write(f"  ↻ Regenerating with feedback from {failed_guardrail}...")
             with st.expander(f"Feedback sent to Gemini (iteration {iteration})"):
@@ -1974,7 +1985,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 )
             except Exception as e:
                 # Gemini gave up (permanent IMAGE_OTHER refusal or other hard error).
-                # Stop the loop and accept the latest passing image as best-effort.
+                # Stop the loop and accept the latest image as best-effort.
                 st.warning(
                     f"Gemini regeneration failed on iteration {iteration} ({e}). "
                     "Stopping the loop and accepting the latest image as best-effort."
@@ -1982,14 +1993,21 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 final_status = "stopped"
                 break
 
-        status.update(
-            label=(
-                f"Step 2 — All guardrails passed after {iteration} iteration(s)"
-                if final_status == "all_passed"
-                else f"Step 2 — Stopped after {iteration} iteration(s) (best effort)"
-            ),
-            state="complete" if final_status == "all_passed" else "error",
-        )
+        if final_status == "all_passed":
+            status.update(
+                label=f"Step 2 — All guardrails passed after {iteration} iteration(s)",
+                state="complete",
+            )
+        elif final_status == "max_iterations":
+            status.update(
+                label=f"Step 2 — Max iterations reached ({MAX_STRICT_ITERATIONS}); accepting best effort",
+                state="complete",
+            )
+        else:
+            status.update(
+                label=f"Step 2 — Stopped after {iteration} iteration(s) (best effort)",
+                state="error",
+            )
 
     if generated_image is None:
         st.error("Profile generation produced no image.")
