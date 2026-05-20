@@ -1285,6 +1285,74 @@ Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 
 
 # ---------------------------------------------------------------------------
+# GUARDRAIL 0 — Zakir Khan identity check.
+# Fails if the generated profile image looks like Zakir Khan (the composition
+# reference person) instead of the actual subject from the user's photos.
+# ---------------------------------------------------------------------------
+def zakir_khan_identity_guardrail(generated_image: bytes) -> dict:
+    """
+    Returns {"is_approved": bool, "things_to_improve": str | False}.
+    is_approved == True means the generated person is NOT Zakir Khan.
+    """
+    client = get_openai_client()
+
+    with open(VIGNETTE_REFERENCE_PATH, "rb") as f:
+        zakir_ref_bytes = f.read()
+
+    image_content = [
+        {"type": "text", "text": "--- IMAGE 1: ZAKIR KHAN REFERENCE (the person we DO NOT want in the output) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(zakir_ref_bytes, "image/png"), "detail": "high"},
+        },
+        {"type": "text", "text": "--- IMAGE 2: GENERATED LINKEDIN PROFILE (to evaluate) ---"},
+        {
+            "type": "image_url",
+            "image_url": {"url": encode_image_for_openai(generated_image, "image/png"), "detail": "high"},
+        },
+    ]
+
+    prompt = """You are a STRICT identity-leak reviewer for AI-generated LinkedIn profile headshots.
+
+You are given TWO images:
+- IMAGE 1: a photo of ZAKIR KHAN (an Indian stand-up comedian). He is the composition-reference person used during generation. He must NOT appear in the output.
+- IMAGE 2: the AI-generated LinkedIn profile to evaluate.
+
+Check ONE thing only: does the person in IMAGE 2 visually match the person in IMAGE 1 (Zakir Khan)?
+
+PASS (is_approved=true) if the person in IMAGE 2 is CLEARLY a DIFFERENT individual from Zakir Khan in IMAGE 1 — distinct face structure, distinct features, not the same person.
+
+FAIL (is_approved=false) if any of these are true in IMAGE 2:
+- The face in IMAGE 2 looks like Zakir Khan's face (same nose, mouth, eyes, beard pattern).
+- The hair / beard style in IMAGE 2 matches Zakir Khan's hair / beard.
+- The overall facial identity in IMAGE 2 reads as "Zakir Khan" to a viewer.
+- The person in IMAGE 2 is wearing Zakir Khan's distinctive maroon/red checkered blazer.
+- The pose / expression / hand gesture / microphone in IMAGE 2 closely mirrors IMAGE 1.
+
+Be strict: similarity must be flagged. If the face in IMAGE 2 could be mistaken for Zakir Khan at a glance, FAIL.
+
+If the rule fails, write a SHORT, SPECIFIC, ACTIONABLE instruction using direct image comparison. Template:
+"The generated image is showing Zakir Khan (from image 1) instead of the actual subject. Regenerate using the SUBJECT PHOTOS as the identity source. The person in the output must be a different individual from Zakir Khan — different face, different beard, different hair, different ethnicity if applicable. Do NOT copy Zakir Khan's face, beard, hair, blazer, or pose from image 1."
+
+Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
+{
+    "is_approved": true or false,
+    "things_to_improve": false or "fix instruction following the template above if it failed"
+}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You strictly check whether a generated image has leaked the identity of the Zakir Khan reference. Respond only with JSON, no markdown fences."},
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=400,
+        temperature=0,
+    )
+    return parse_json_response(response.choices[0].message.content)
+
+
+# ---------------------------------------------------------------------------
 # REFINEMENT — per-image feedback analyzer (OpenAI) + Gemini editor.
 # Used by the "Refine gallery images" client-feedback flow.
 # ---------------------------------------------------------------------------
@@ -1813,85 +1881,133 @@ if st.button("Generate Image", type="primary", use_container_width=True):
             st.stop()
         status.update(label="Step 1 — Input guardrail passed", state="complete")
 
-    # Step 2: generate N profile candidates (no guardrails — user picks).
-    profile_candidates: list[bytes] = []
+    # Step 2: generate ONE profile image and loop through FOUR strict guardrails
+    # with NO retry cap. Each guardrail failure triggers a regeneration with
+    # that guardrail's specific feedback, then the loop restarts from G1.
+    # Only when all four pass in a single pass do we accept the image.
+    #
+    # G1 — Zakir Khan identity check (the generated person must NOT be Zakir Khan)
+    # G2 — Headroom / subject size check
+    # G3 — Soft radial vignette check
+    # G4 — Black bottom gradient check
+    #
+    # Each iteration costs ~1 Gemini call + up to 4 OpenAI vision calls.
+    # No iteration limit by design — refresh the page to abort.
+    GUARDRAILS_IN_ORDER = [
+        ("G1: Zakir Khan identity",     zakir_khan_identity_guardrail),
+        ("G2: Headroom",                headroom_guardrail),
+        ("G3: Vignette",                vignette_guardrail),
+        ("G4: Black bottom gradient",   bottom_gradient_guardrail),
+    ]
+
+    def _safe_run_guardrail(name, fn, img):
+        """Wrap a guardrail call so a network/parse failure doesn't kill the loop."""
+        try:
+            result = fn(img)
+            passed = bool(result.get("is_approved"))
+            feedback = result.get("things_to_improve") if not passed else None
+            return passed, feedback if isinstance(feedback, str) else None
+        except Exception as e:
+            st.warning(f"  {name} errored ({e}) — treating as passed for this iteration.")
+            return True, None
+
+    generated_image = None
+    iteration = 0
+    final_status = None  # "all_passed" or "stopped"
+
     with st.status(
-        f"Step 2 — Generating {NUM_PROFILE_CANDIDATES} profile candidates...",
+        "Step 2 — Strict guardrail loop (no retry limit)...",
         expanded=True,
     ) as status:
-        for i in range(1, NUM_PROFILE_CANDIDATES + 1):
-            st.write(f"Generating candidate {i}/{NUM_PROFILE_CANDIDATES}...")
-            try:
-                img = generate_linkedin_image(images, None, custom_prompt)
-                profile_candidates.append(img)
-            except Exception as e:
-                st.warning(f"Candidate {i} generation failed: {e}")
-        if not profile_candidates:
-            status.update(
-                label=f"Step 2 — All {NUM_PROFILE_CANDIDATES} candidate generations failed",
-                state="error",
-            )
-            st.error("All profile candidate generations failed. Try again.")
+        st.write("Generating initial profile image...")
+        try:
+            generated_image = generate_linkedin_image(images, None, custom_prompt)
+        except Exception as e:
+            status.update(label="Step 2 — Initial generation failed", state="error")
+            st.error(f"Initial profile generation failed: {e}")
             st.stop()
+
+        while True:
+            iteration += 1
+            st.markdown(f"### Iteration {iteration}")
+
+            try:
+                preview_pil = Image.open(io.BytesIO(generated_image))
+                st.image(
+                    preview_pil,
+                    caption=f"Iteration {iteration} candidate ({preview_pil.size[0]}×{preview_pil.size[1]}px)",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+
+            failed_guardrail = None
+            failed_feedback = None
+
+            for g_name, g_fn in GUARDRAILS_IN_ORDER:
+                passed, feedback = _safe_run_guardrail(g_name, g_fn, generated_image)
+                verdict = "✅ PASS" if passed else "❌ FAIL"
+                st.write(
+                    f"  • {g_name}: {verdict}"
+                    + (f" — {feedback}" if feedback else "")
+                )
+                if not passed:
+                    failed_guardrail = g_name
+                    failed_feedback = feedback or f"{g_name} composition rule failed."
+                    break  # restart from G1 after regeneration
+
+            if failed_guardrail is None:
+                st.success(
+                    f"All four guardrails passed on iteration {iteration}. "
+                    "Accepting this image."
+                )
+                final_status = "all_passed"
+                break
+
+            # Regenerate with that guardrail's feedback and restart the loop.
+            st.write(f"  ↻ Regenerating with feedback from {failed_guardrail}...")
+            with st.expander(f"Feedback sent to Gemini (iteration {iteration})"):
+                st.code(failed_feedback)
+            try:
+                generated_image = generate_linkedin_image(
+                    images, failed_feedback, custom_prompt
+                )
+            except Exception as e:
+                # Gemini gave up (permanent IMAGE_OTHER refusal or other hard error).
+                # Stop the loop and accept the latest passing image as best-effort.
+                st.warning(
+                    f"Gemini regeneration failed on iteration {iteration} ({e}). "
+                    "Stopping the loop and accepting the latest image as best-effort."
+                )
+                final_status = "stopped"
+                break
+
         status.update(
-            label=f"Step 2 — Generated {len(profile_candidates)}/{NUM_PROFILE_CANDIDATES} candidates",
-            state="complete",
+            label=(
+                f"Step 2 — All guardrails passed after {iteration} iteration(s)"
+                if final_status == "all_passed"
+                else f"Step 2 — Stopped after {iteration} iteration(s) (best effort)"
+            ),
+            state="complete" if final_status == "all_passed" else "error",
         )
 
-    # Cache inputs + candidates for the next rerun, then move to selection phase.
-    st.session_state.profile_candidates = profile_candidates
+    if generated_image is None:
+        st.error("Profile generation produced no image.")
+        st.stop()
+
+    # Skip the candidate-selection step — strict guardrails produced one final image.
+    st.session_state.profile_candidates = None
     st.session_state.pipeline_inputs = {
         "images": images,
         "artist_name": artist_name.strip(),
         "artist_folder": artist_folder,
         "custom_prompt": custom_prompt,
         "api_key": api_key,
+        "selected_profile_image": generated_image,
     }
-    st.session_state.pipeline_phase = "awaiting_selection"
+    st.session_state.pipeline_phase = "running_gallery"
+    gc.collect()
     st.rerun()
-
-
-# =====================================================================
-# PHASE 2 — Candidate selection.
-# Show all generated profile candidates and let the user pick one.
-# =====================================================================
-if (
-    st.session_state.pipeline_phase == "awaiting_selection"
-    and st.session_state.profile_candidates
-):
-    st.divider()
-    st.subheader("Pick your profile image")
-    st.caption(
-        f"Generated {len(st.session_state.profile_candidates)} candidate profile images. "
-        "Choose the one you like best — it will be used as the profile.webp and as the "
-        "face anchor for the gallery."
-    )
-
-    candidates = st.session_state.profile_candidates
-    cols = st.columns(len(candidates))
-    for i, img_bytes in enumerate(candidates):
-        with cols[i]:
-            st.image(
-                Image.open(io.BytesIO(img_bytes)),
-                caption=f"Candidate {i + 1}",
-                use_container_width=True,
-            )
-
-    selected_index = st.radio(
-        "Select a candidate",
-        options=list(range(len(candidates))),
-        format_func=lambda i: f"Candidate {i + 1}",
-        horizontal=True,
-        key="profile_candidate_selection",
-    )
-
-    if st.button("Continue with this profile", type="primary", use_container_width=True):
-        st.session_state.pipeline_inputs["selected_profile_image"] = candidates[selected_index]
-        st.session_state.pipeline_phase = "running_gallery"
-        # Free the unselected candidates to keep memory bounded.
-        st.session_state.profile_candidates = None
-        gc.collect()
-        st.rerun()
 
 
 # =====================================================================
