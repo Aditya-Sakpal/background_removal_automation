@@ -198,7 +198,7 @@ def extract_image_from_gemini_response(response, context: str = "image") -> byte
 def call_gemini_with_retry(
     client,
     *,
-    +model: str,
+    model: str,
     contents: list,
     config,
     context: str,
@@ -1258,6 +1258,108 @@ Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
 
 
 # ---------------------------------------------------------------------------
+# REFINEMENT — per-image feedback analyzer (OpenAI) + Gemini editor.
+# Used by the "Refine gallery images" client-feedback flow.
+# ---------------------------------------------------------------------------
+def analyze_gallery_image_for_feedback(
+    gallery_image: bytes,
+    client_feedback: str,
+) -> dict:
+    """
+    Ask GPT-4o to look at ONE gallery image and produce a specific, actionable
+    instruction string that captures what needs to change in THIS particular image,
+    grounded in the client's general feedback.
+
+    Returns {"needs_refinement": bool, "instruction": str | None}.
+    If the image doesn't exhibit the problem described, needs_refinement is False.
+    """
+    client = get_openai_client()
+
+    image_content = [
+        {"type": "text", "text": "--- GALLERY IMAGE TO ANALYZE ---"},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": encode_image_for_openai(gallery_image, "image/webp"),
+                "detail": "high",
+            },
+        },
+    ]
+
+    prompt = f"""You are an image quality reviewer for a website's artist gallery.
+
+The client has shared the following general feedback about the gallery images and wants them refined:
+
+CLIENT FEEDBACK:
+\"\"\"{client_feedback}\"\"\"
+
+Look at the image above and decide whether it exhibits the problem(s) described. If yes, produce ONE concise, specific, ACTIONABLE instruction (a single short paragraph) that an image editing model can follow to fix the issue in THIS image. Be concrete — point at WHERE in the image the issue is (e.g., "the upper-left corner has visible text 'Comedy Night 2024' on the backdrop", "a logo of XYZ Network is in the bottom-right corner") and what should replace it (e.g., "remove the text and replace with a clean continuation of the dark backdrop").
+
+If the image does NOT exhibit the problem the client described, return needs_refinement=false and instruction=null. Do not invent issues.
+
+Do not change the subject, their face, their clothing, their pose, the lighting, or the overall scene. Refinement is ONLY to address the client's specific complaint.
+
+Respond ONLY with valid JSON (no markdown fences) in this EXACT schema:
+{{
+    "needs_refinement": true or false,
+    "instruction": "specific actionable instruction" or null
+}}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You analyze a single image against client feedback. Output only valid JSON, no markdown.",
+            },
+            {"role": "user", "content": [{"type": "text", "text": prompt}] + image_content},
+        ],
+        max_tokens=400,
+        temperature=0,
+    )
+    return parse_json_response(response.choices[0].message.content)
+
+
+def refine_gallery_image_with_feedback(
+    gallery_image: bytes,
+    instruction: str,
+) -> bytes:
+    """
+    Ask Gemini (Nano Banana) to edit a single gallery image guided by the
+    OpenAI-generated instruction. Returns refined image bytes at the same
+    aspect/size as the input (caller is responsible for re-cropping/encoding).
+
+    NOTE: Gemini's image-edit path on real-person photos often refuses with
+    IMAGE_OTHER. The retry helper handles transient failures; permanent
+    refusals will raise RuntimeError, which the caller should catch and treat
+    as "keep original image".
+    """
+    client = get_gemini_client()
+
+    src_img = Image.open(io.BytesIO(gallery_image)).convert("RGB")
+
+    prompt = (
+        "Refine this image with a minimal, targeted edit.\n\n"
+        f"Specific instruction:\n{instruction}\n\n"
+        "Keep the person, their face, their clothing, their pose, the lighting, "
+        "and the overall composition EXACTLY the same. Only address the specific "
+        "instruction above. Return a single high-quality landscape image at the "
+        "same aspect ratio as the input."
+    )
+
+    edited_bytes = call_gemini_with_retry(
+        client,
+        model=NANO_BANANA_REGEN_MODEL,
+        contents=[src_img, prompt],
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+        ),
+        context="gallery refinement",
+    )
+    return edited_bytes
+
+
+# ---------------------------------------------------------------------------
 # GUARDRAIL 3 – Gallery face-match check
 # ---------------------------------------------------------------------------
 def gallery_face_match_guardrail(
@@ -2123,4 +2225,148 @@ if result_data:
             st.success(
                 f"Added {len(extra_new_outputs)} new gallery image(s). Total now: {len(merged_outputs)}."
             )
+            st.rerun()
+
+    # ── Refine gallery images with client feedback ───────────────────────────
+    # Each gallery image is processed one-by-one:
+    #   1. OpenAI looks at the image + client's general feedback → outputs a
+    #      specific actionable instruction for THIS image.
+    #   2. Gemini (Nano Banana) edits the image using that instruction.
+    #   3. The refined image replaces the original. If Gemini refuses (common
+    #      for real-person photo edits), the original is kept and a warning is
+    #      shown for that image.
+    st.divider()
+    st.subheader("Refine gallery images with client feedback")
+    st.caption(
+        "Describe what the client wants changed across the gallery (e.g., "
+        "\"remove text/logos from the background\", \"make the lighting warmer\"). "
+        "Each image will be analysed individually by OpenAI to produce a specific "
+        "fix, then refined by Gemini one image at a time."
+    )
+
+    client_feedback_text = st.text_area(
+        "Client feedback",
+        placeholder='e.g., "There is visible text on the backdrop in some images. '
+                    'Please remove any banners, signage, or logos from the background '
+                    'while keeping the person and scene unchanged."',
+        key="gallery_refine_feedback",
+        height=100,
+    )
+
+    if st.button(
+        "Refine all gallery images",
+        type="secondary",
+        use_container_width=True,
+        key="btn_refine_gallery",
+        disabled=not client_feedback_text.strip(),
+    ):
+        feedback_clean = client_feedback_text.strip()
+        if not feedback_clean:
+            st.warning("Please enter the client's feedback first.")
+        else:
+            refined_outputs: list[tuple[str, bytes, bool]] = []
+            n_total = len(gallery_outputs)
+            n_refined = 0
+            n_skipped = 0
+            n_failed = 0
+
+            with st.status(
+                f"Refining {n_total} gallery image(s) one at a time...",
+                expanded=True,
+            ) as status:
+                progress = st.progress(0, text=f"0/{n_total}")
+
+                for idx, (name, original_bytes, original_within_limit) in enumerate(gallery_outputs, start=1):
+                    st.write(f"**{name} ({idx}/{n_total})**")
+
+                    # Step A: OpenAI per-image analysis
+                    try:
+                        analysis = analyze_gallery_image_for_feedback(
+                            original_bytes, feedback_clean
+                        )
+                    except Exception as e:
+                        st.warning(f"  ⚠ OpenAI analysis failed for {name}: {e} — keeping original.")
+                        refined_outputs.append((name, original_bytes, original_within_limit))
+                        n_failed += 1
+                        progress.progress(int((idx / n_total) * 100), text=f"{idx}/{n_total}")
+                        gc.collect()
+                        continue
+
+                    needs_refine = bool(analysis.get("needs_refinement"))
+                    instruction = analysis.get("instruction") or ""
+
+                    if not needs_refine or not instruction.strip():
+                        st.write(f"  • No refinement needed for {name} — keeping original.")
+                        refined_outputs.append((name, original_bytes, original_within_limit))
+                        n_skipped += 1
+                        progress.progress(int((idx / n_total) * 100), text=f"{idx}/{n_total}")
+                        gc.collect()
+                        continue
+
+                    with st.expander(f"OpenAI instruction for {name}"):
+                        st.code(instruction)
+
+                    # Step B: Gemini edit using the instruction
+                    try:
+                        edited_raw = refine_gallery_image_with_feedback(original_bytes, instruction)
+                    except Exception as e:
+                        st.warning(
+                            f"  ⚠ Gemini refused or failed to refine {name} ({e}) — keeping original."
+                        )
+                        refined_outputs.append((name, original_bytes, original_within_limit))
+                        n_failed += 1
+                        progress.progress(int((idx / n_total) * 100), text=f"{idx}/{n_total}")
+                        gc.collect()
+                        continue
+
+                    # Step C: re-crop / re-encode to gallery WebP spec
+                    try:
+                        new_webp, new_within_limit = prepare_gallery_webp(edited_raw)
+                    except Exception as e:
+                        st.warning(
+                            f"  ⚠ WebP export failed for refined {name} ({e}) — keeping original."
+                        )
+                        refined_outputs.append((name, original_bytes, original_within_limit))
+                        n_failed += 1
+                        progress.progress(int((idx / n_total) * 100), text=f"{idx}/{n_total}")
+                        gc.collect()
+                        continue
+
+                    if not new_webp:
+                        st.warning(f"  ⚠ Empty refined WebP for {name} — keeping original.")
+                        refined_outputs.append((name, original_bytes, original_within_limit))
+                        n_failed += 1
+                    else:
+                        st.write(f"  ✓ Refined {name} successfully.")
+                        refined_outputs.append((name, new_webp, new_within_limit))
+                        n_refined += 1
+
+                    del edited_raw
+                    progress.progress(int((idx / n_total) * 100), text=f"{idx}/{n_total}")
+                    gc.collect()
+
+                status.update(
+                    label=(
+                        f"Refinement complete — refined: {n_refined}, "
+                        f"skipped (no issue): {n_skipped}, kept original (failed): {n_failed}"
+                    ),
+                    state="complete",
+                )
+
+            # Rebuild ZIP with the refined gallery + same profile.
+            new_zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(new_zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"{artist_folder}/profile.webp", profile_webp_bytes)
+                for name, data, _ in refined_outputs:
+                    zf.writestr(f"{artist_folder}/{name}", data)
+
+            st.session_state.result_data = {
+                **result_data,
+                "gallery_outputs": refined_outputs,
+                "zip_bytes": new_zip_buffer.getvalue(),
+            }
+            st.success(
+                f"Gallery refined. Refined {n_refined}, kept original {n_skipped + n_failed}."
+            )
+            gc.collect()
             st.rerun()
