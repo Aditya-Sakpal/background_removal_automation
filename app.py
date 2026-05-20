@@ -198,7 +198,7 @@ def extract_image_from_gemini_response(response, context: str = "image") -> byte
 def call_gemini_with_retry(
     client,
     *,
-    model: str,
+    +model: str,
     contents: list,
     config,
     context: str,
