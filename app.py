@@ -607,15 +607,42 @@ def prepare_webp_with_constraints(
     return last_bytes or b"", False
 
 
+def _encode_rgb_to_webp(img: Image.Image, max_size_kb: int) -> tuple[bytes, bool]:
+    """Encode an already-sized RGB PIL image to WebP under max_size_kb."""
+    size_limit = max_size_kb * 1024
+    last_bytes = None
+    for quality in [95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30]:
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=quality, method=6, optimize=True)
+        candidate = buf.getvalue()
+        last_bytes = candidate
+        if len(candidate) <= size_limit:
+            return candidate, True
+    return last_bytes or b"", False
+
+
 def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
-    return prepare_webp_with_constraints(
-        image_bytes=image_bytes,
-        width=PROFILE_WIDTH,
-        height=PROFILE_HEIGHT,
-        max_size_kb=PROFILE_MAX_SIZE_KB,
-        horizontal_focus=0.5,
-        vertical_focus=0.5,
-    )
+    """
+    Profile banner: landmark-aligned cutout on fixed template (765×480),
+    then WebP encode. Falls back to center crop if alignment fails.
+    """
+    try:
+        from profile_align import align_profile_to_grid
+
+        aligned = align_profile_to_grid(image_bytes)
+        if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
+            aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+        return _encode_rgb_to_webp(aligned, PROFILE_MAX_SIZE_KB)
+    except Exception as e:
+        print(f"[profile_align] fallback to center crop: {type(e).__name__}: {e}")
+        return prepare_webp_with_constraints(
+            image_bytes=image_bytes,
+            width=PROFILE_WIDTH,
+            height=PROFILE_HEIGHT,
+            max_size_kb=PROFILE_MAX_SIZE_KB,
+            horizontal_focus=0.5,
+            vertical_focus=0.5,
+        )
 
 
 def prepare_gallery_webp(image_bytes: bytes) -> tuple[bytes, bool]:
