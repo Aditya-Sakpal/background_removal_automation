@@ -13,6 +13,9 @@ import io
 import os
 from functools import lru_cache
 
+# Max long edge before alignment (avoids OOM on Render for huge Gemini PNGs).
+_ALIGN_MAX_EDGE = int(os.getenv("PROFILE_ALIGN_MAX_EDGE", "1920"))
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -94,11 +97,30 @@ def _get_face_landmarker() -> FaceLandmarker:
     return _face_landmarker
 
 
+def _rgb_for_mediapipe(image: Image.Image) -> np.ndarray:
+    """Contiguous uint8 RGB array — avoids MediaPipe Image __del__ errors on some hosts."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return np.ascontiguousarray(arr)
+
+
 def _face_metrics_mediapipe(rgb: np.ndarray) -> tuple[float, float, float] | None:
     h, w = rgb.shape[:2]
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result = _get_face_landmarker().detect(mp_image)
-    if not result.face_landmarks:
+    if rgb.dtype != np.uint8:
+        rgb = rgb.astype(np.uint8)
+    rgb = np.ascontiguousarray(rgb)
+
+    mp_image = None
+    result = None
+    try:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = _get_face_landmarker().detect(mp_image)
+    finally:
+        if mp_image is not None:
+            close_fn = getattr(mp_image, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    if result is None or not result.face_landmarks:
         return None
 
     lm = result.face_landmarks[0]
@@ -156,9 +178,44 @@ def is_face_on_guides(image: Image.Image, tolerance: float = GUIDE_TOLERANCE_PX)
     )
 
 
+def ensure_face_landmarker_model() -> None:
+    """Download face_landmarker.task if missing (call once at app startup)."""
+    _ensure_face_landmarker_model()
+    _get_face_landmarker()
+
+
+def _use_mediapipe_detection() -> bool:
+    """
+    MediaPipe is accurate but can crash on cleanup (Render logs).
+    PROFILE_ALIGN_USE_MEDIAPIPE: 1|0|auto (default auto → off when RENDER=true).
+    """
+    mode = os.getenv("PROFILE_ALIGN_USE_MEDIAPIPE", "auto").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        return False
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    return not bool(os.getenv("RENDER"))
+
+
+def _downscale_if_needed(image: Image.Image, max_edge: int = _ALIGN_MAX_EDGE) -> Image.Image:
+    w, h = image.size
+    if max(w, h) <= max_edge:
+        return image
+    scale = max_edge / max(w, h)
+    return image.resize(
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        Image.Resampling.LANCZOS,
+    )
+
+
 def detect_face_metrics(image: Image.Image) -> tuple[float, float, float]:
-    rgb = np.asarray(image.convert("RGB"))
-    metrics = _face_metrics_mediapipe(rgb)
+    rgb = _rgb_for_mediapipe(image)
+    metrics = None
+    if _use_mediapipe_detection():
+        try:
+            metrics = _face_metrics_mediapipe(rgb)
+        except Exception as exc:
+            print(f"[profile_align] MediaPipe detect failed, using OpenCV: {exc}")
     if metrics is None:
         metrics = _face_metrics_haar_fallback(rgb)
     if metrics is None:
@@ -252,7 +309,7 @@ def align_profile_to_grid(image_bytes: bytes) -> Image.Image:
     Preserves the full Gemini render (background + bottom fade); no rembg by default.
     Repeats until landmarks sit on guides (≤3 px) or MAX_ALIGN_PASSES.
     """
-    current = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    current = _downscale_if_needed(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
     result = current
     for pass_idx in range(MAX_ALIGN_PASSES):
         metrics = detect_face_metrics(current)

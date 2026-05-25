@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: engage4more-image-gen
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: PROFILE_ALIGN_USE_MEDIAPIPE
+        value: "0"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SERPAPI_API_KEY
+        sync: false

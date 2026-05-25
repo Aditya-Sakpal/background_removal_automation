@@ -621,23 +621,64 @@ def _encode_rgb_to_webp(img: Image.Image, max_size_kb: int) -> tuple[bytes, bool
     return last_bytes or b"", False
 
 
-def apply_profile_alignment(image_bytes: bytes) -> tuple[bytes, bool]:
+def check_profile_align_ready() -> tuple[bool, str]:
+    """Verify mediapipe + face landmarker model are available before alignment."""
+    try:
+        import mediapipe  # noqa: F401
+        from profile_align import ensure_face_landmarker_model
+
+        ensure_face_landmarker_model()
+    except ImportError:
+        return False, "mediapipe is not installed. Run: pip install -r requirements.txt (Python 3.12)."
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, ""
+
+
+def apply_profile_alignment(image_bytes: bytes) -> tuple[bytes, bool, str | None]:
     """
     Run face alignment on 765×480 PNG (preserves Gemini background).
-    Returns (image_bytes, True) on success; on failure returns original bytes, False.
+    Returns (image_bytes, success, error_message).
     """
-    try:
-        from profile_align import align_profile_to_grid
+    from profile_align import align_profile_to_grid
 
-        aligned = align_profile_to_grid(image_bytes)
-        if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
-            aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+    last_err: str | None = None
+    for attempt in range(1, 4):
+        try:
+            aligned = align_profile_to_grid(image_bytes)
+            if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
+                aligned = aligned.resize(
+                    (PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS
+                )
+            buf = io.BytesIO()
+            aligned.save(buf, format="PNG")
+            return buf.getvalue(), True, None
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e} (attempt {attempt}/3)"
+            print(f"[profile_align] {last_err}")
+
+    # Last resort: center-crop to banner size (better than raw oversized Gemini).
+    try:
+        cropped_bytes, _ = prepare_webp_with_constraints(
+            image_bytes=image_bytes,
+            width=PROFILE_WIDTH,
+            height=PROFILE_HEIGHT,
+            max_size_kb=500,
+            horizontal_focus=0.5,
+            vertical_focus=0.35,
+        )
+        img = Image.open(io.BytesIO(cropped_bytes)).convert("RGB")
         buf = io.BytesIO()
-        aligned.save(buf, format="PNG")
-        return buf.getvalue(), True
-    except Exception as e:
-        print(f"[profile_align] fallback to raw image: {type(e).__name__}: {e}")
-        return image_bytes, False
+        img.save(buf, format="PNG")
+        return (
+            buf.getvalue(),
+            True,
+            f"guide alignment failed ({last_err}); used center-crop fallback",
+        )
+    except Exception as crop_err:
+        print(f"[profile_align] center-crop fallback failed: {crop_err}")
+
+    return image_bytes, False, last_err
 
 
 def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
@@ -1579,6 +1620,17 @@ st.caption(
     "One click generates profile + final top 10 gallery images."
 )
 
+_align_ok, _align_msg = check_profile_align_ready()
+if _align_ok:
+    _mp_note = (
+        "OpenCV face detection (Render-safe)"
+        if os.getenv("RENDER") or os.getenv("PROFILE_ALIGN_USE_MEDIAPIPE", "").strip() in ("0", "false")
+        else "MediaPipe + OpenCV"
+    )
+    st.caption(f"Face alignment: ready (guides Y 74–303, center X 382.5) — {_mp_note}.")
+else:
+    st.warning(f"Face alignment not ready — {_align_msg}")
+
 artist_name = st.text_input("Artist name", placeholder="e.g., Ankur Warikoo")
 optional_tags = st.text_area(
     "Optional tags/prompts",
@@ -1613,7 +1665,7 @@ st.caption(
     f"plus banner aspect ~{GALLERY_WIDTH}×{GALLERY_HEIGHT}. "
     "Set `GOOGLE_CSE_API_KEY`, `GOOGLE_CSE_ID`, and `OPENAI_API_KEY` in `.env`."
 )
-if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (Google API)", key="btn_google_pool", use_container_width=False):
+if st.button(f"Fetch {REFERENCE_IMAGE_POOL_SIZE} images (Google API)", key="btn_google_pool", width="content"):
     st.session_state.reference_pool_rows = None
     st.session_state.reference_top6_indices = None
     st.session_state.reference_rank_note = None
@@ -1701,7 +1753,7 @@ if st.session_state.reference_pool_rows:
                 cap_parts.append(f"r={row['aspect_ratio']:.2f}")
             caption = " · ".join(cap_parts)
             if row.get("bytes"):
-                st.image(row["bytes"], caption=caption, use_container_width=True)
+                st.image(row["bytes"], caption=caption, width="stretch")
             else:
                 st.warning(f"{caption}\nCould not load: {row.get('error', 'unknown')}")
             if row.get("link"):
@@ -1722,7 +1774,7 @@ if st.session_state.reference_pool_rows:
             with cols6[j % 3]:
                 cap = f"Pick #{j + 1} · pool idx {pool_idx}"
                 if row.get("bytes"):
-                    st.image(row["bytes"], caption=cap, use_container_width=True)
+                    st.image(row["bytes"], caption=cap, width="stretch")
                 else:
                     st.warning(f"{cap} — missing bytes")
                 if row.get("link"):
@@ -1735,7 +1787,7 @@ if st.session_state.reference_pool_rows:
         if st.button(
             f"Regenerate top {REFERENCE_TOP_K_OPENAI} with Gemini (clean + WebP)",
             key="btn_regen_top6_gemini",
-            use_container_width=False,
+            width="content",
         ):
             st.session_state.reference_regenerated = None
             pool = st.session_state.reference_pool_rows
@@ -1813,7 +1865,7 @@ if st.session_state.reference_pool_rows:
                     st.image(
                         Image.open(io.BytesIO(item["webp_bytes"])),
                         caption=f"pool idx {item.get('pool_idx')}",
-                        use_container_width=True,
+                        width="stretch",
                     )
                     st.download_button(
                         label=f"Download regen_{slot}.webp",
@@ -1821,7 +1873,7 @@ if st.session_state.reference_pool_rows:
                         file_name=f"gallery_regen_{slot}.webp",
                         mime="image/webp",
                         key=f"dl_regen_{slot}",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.error(f"Regen #{slot} failed: {item.get('error', 'unknown')}")
@@ -1863,7 +1915,7 @@ if uploaded_files:
                 f.seek(0)
                 img_bytes = f.read()
                 f.seek(0)
-                st.image(img_bytes, caption=f.name, use_container_width=True)
+                st.image(img_bytes, caption=f.name, width="stretch")
             except Exception as e:
                 st.warning(f"Cannot preview {f.name}: {e}")
 
@@ -1874,7 +1926,7 @@ NUM_PROFILE_CANDIDATES = 3
 # Validate inputs, run input guardrail, generate 3 profile candidates
 # (no output/composition guardrails — the user chooses the best one).
 # =====================================================================
-if st.button("Generate Image", type="primary", use_container_width=True):
+if st.button("Generate Image", type="primary", width="stretch"):
     # Reset any prior run.
     st.session_state.result_data = None
     st.session_state.profile_candidates = None
@@ -1999,13 +2051,19 @@ if st.button("Generate Image", type="primary", use_container_width=True):
 
             if candidate_img is not None:
                 with st.spinner(f"  Aligning candidate {i} (face guides, keep Gemini background)..."):
-                    aligned_bytes, aligned_ok = apply_profile_alignment(candidate_img)
+                    aligned_bytes, aligned_ok, align_err = apply_profile_alignment(
+                        candidate_img
+                    )
                 if aligned_ok:
-                    st.write("  ✅ Face aligned to guides (765×480, background preserved)")
+                    if align_err and "center-crop fallback" in align_err:
+                        st.write(f"  ⚠ Partial align: {align_err}")
+                    else:
+                        st.write("  ✅ Face aligned to guides (765×480, background preserved)")
                     profile_candidates.append(aligned_bytes)
                 else:
                     st.warning(
-                        "  ⚠ Alignment failed — showing raw Gemini output for this candidate"
+                        "  ⚠ Alignment failed — showing raw Gemini output for this candidate. "
+                        f"**Reason:** {align_err or 'unknown'}"
                     )
                     profile_candidates.append(candidate_img)
             else:
@@ -2059,7 +2117,7 @@ if (
             st.image(
                 Image.open(io.BytesIO(img_bytes)),
                 caption=f"Candidate {i + 1}",
-                use_container_width=True,
+                width="stretch",
             )
 
     selected_index = st.radio(
@@ -2070,7 +2128,7 @@ if (
         key="profile_candidate_selection",
     )
 
-    if st.button("Continue with this profile", type="primary", use_container_width=True):
+    if st.button("Continue with this profile", type="primary", width="stretch"):
         st.session_state.pipeline_inputs["selected_profile_image"] = candidates[selected_index]
         st.session_state.pipeline_phase = "running_gallery"
         # Free the unselected candidates to keep memory bounded.
@@ -2263,14 +2321,14 @@ if result_data:
     all_outputs = [("profile.webp", profile_webp_bytes)] + [(name, data) for name, data, _ in gallery_outputs]
     for idx, (name, data) in enumerate(all_outputs):
         with preview_cols[idx % 3]:
-            st.image(Image.open(io.BytesIO(data)), caption=f"{name} ({len(data)/1024:.1f} KB)", use_container_width=True)
+            st.image(Image.open(io.BytesIO(data)), caption=f"{name} ({len(data)/1024:.1f} KB)", width="stretch")
 
     st.download_button(
         label="Download All Images (ZIP)",
         data=zip_bytes,
         file_name=f"{artist_folder}_images.zip",
         mime="application/zip",
-        use_container_width=True,
+        width="stretch",
     )
 
     # ── Fetch 10 more gallery images ─────────────────────────────────────────
@@ -2287,7 +2345,7 @@ if result_data:
         if st.button(
             f"Fetch {EXTRA_GALLERY_BATCH_SIZE} more gallery images",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             key="btn_fetch_more_gallery",
         ):
             inputs = st.session_state.pipeline_inputs
@@ -2468,7 +2526,7 @@ if result_data:
     if st.button(
         "Refine all gallery images",
         type="secondary",
-        use_container_width=True,
+        width="stretch",
         key="btn_refine_gallery",
         disabled=not client_feedback_text.strip(),
     ):
