@@ -621,10 +621,10 @@ def _encode_rgb_to_webp(img: Image.Image, max_size_kb: int) -> tuple[bytes, bool
     return last_bytes or b"", False
 
 
-def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
+def apply_profile_alignment(image_bytes: bytes) -> tuple[bytes, bool]:
     """
-    Profile banner: landmark-aligned cutout on fixed template (765×480),
-    then WebP encode. Falls back to center crop if alignment fails.
+    Run face alignment on 765×480 PNG (preserves Gemini background).
+    Returns (image_bytes, True) on success; on failure returns original bytes, False.
     """
     try:
         from profile_align import align_profile_to_grid
@@ -632,6 +632,27 @@ def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
         aligned = align_profile_to_grid(image_bytes)
         if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
             aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        aligned.save(buf, format="PNG")
+        return buf.getvalue(), True
+    except Exception as e:
+        print(f"[profile_align] fallback to raw image: {type(e).__name__}: {e}")
+        return image_bytes, False
+
+
+def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
+    """
+    Profile banner → align face to guides (74–303 Y, center X) then WebP.
+    Always verifies guides — never skips alignment just because size is 765×480.
+    """
+    try:
+        from profile_align import align_profile_to_grid, is_face_on_guides
+
+        aligned = align_profile_to_grid(image_bytes)
+        if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
+            aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+        if not is_face_on_guides(aligned):
+            print("[profile_align] warning: face still off guides after alignment")
         return _encode_rgb_to_webp(aligned, PROFILE_MAX_SIZE_KB)
     except Exception as e:
         print(f"[profile_align] fallback to center crop: {type(e).__name__}: {e}")
@@ -1924,7 +1945,7 @@ if st.button("Generate Image", type="primary", use_container_width=True):
     profile_candidates: list[bytes] = []
     with st.status(
         f"Step 2 — Generating {NUM_PROFILE_CANDIDATES} profile candidates "
-        f"(with Zakir check + up to {ZAKIR_MAX_RETRIES} retries each)...",
+        f"(Gemini → align face to guides; Zakir check + up to {ZAKIR_MAX_RETRIES} retries each)...",
         expanded=True,
     ) as status:
         for i in range(1, NUM_PROFILE_CANDIDATES + 1):
@@ -1977,7 +1998,16 @@ if st.button("Generate Image", type="primary", use_container_width=True):
                 feedback_for_next = ZAKIR_REGEN_FEEDBACK
 
             if candidate_img is not None:
-                profile_candidates.append(candidate_img)
+                with st.spinner(f"  Aligning candidate {i} (face guides, keep Gemini background)..."):
+                    aligned_bytes, aligned_ok = apply_profile_alignment(candidate_img)
+                if aligned_ok:
+                    st.write("  ✅ Face aligned to guides (765×480, background preserved)")
+                    profile_candidates.append(aligned_bytes)
+                else:
+                    st.warning(
+                        "  ⚠ Alignment failed — showing raw Gemini output for this candidate"
+                    )
+                    profile_candidates.append(candidate_img)
             else:
                 st.warning(f"Candidate {i} produced no image.")
 
@@ -2017,9 +2047,9 @@ if (
     st.divider()
     st.subheader("Pick your profile image")
     st.caption(
-        f"Generated {len(st.session_state.profile_candidates)} candidate profile images. "
-        "Choose the one you like best — it will be used as the profile.webp and as the "
-        "face anchor for the gallery."
+        f"Generated {len(st.session_state.profile_candidates)} candidate profile images "
+        "(face aligned to designer guides on 765×480; Gemini gradient/background kept). "
+        "Choose the one you like best — it becomes profile.webp and the gallery face anchor."
     )
 
     candidates = st.session_state.profile_candidates

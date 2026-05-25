@@ -1,8 +1,10 @@
 """
 Deterministic profile banner alignment (765×480).
 
-Pipeline: background removal → MediaPipe face metrics → scale/translate cutout
-→ composite on fixed gradient template using designer guide Y positions.
+Default: scale + translate the full Gemini image so the face sits on designer
+guides (Y 74–303, centered at X 382.5) while keeping Gemini's gradient/background.
+
+Optional cutout+template path exists only as fallback (not used by default).
 """
 
 from __future__ import annotations
@@ -33,15 +35,20 @@ FACE_LANDMARKER_MODEL_URL = (
     "face_landmarker/float16/1/face_landmarker.task"
 )
 
-# Extend above forehead landmark to approximate hairline (fraction of forehead→chin).
-HAIRLINE_EXTENSION = 0.22
+# MediaPipe indices for top-of-head band (used for hairline Y = guide top).
+_CRANIAL_TOP_INDICES = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288)
+_CHIN_INDEX = 152
+_LEFT_TEMPLE_INDEX = 234
+_RIGHT_TEMPLE_INDEX = 454
+# Nudge above mesh cranial top to include visible hair (fraction of face height).
+_HAIR_ABOVE_MESH = 0.04
 
 _face_landmarker: FaceLandmarker | None = None
 
 
 @lru_cache(maxsize=1)
 def get_profile_template() -> Image.Image:
-    """Build 765×480 background: radial blue vignette + black bottom gradation overlay."""
+    """Synthetic 765×480 background (fallback only — prefer preserving Gemini BG)."""
     w, h = PROFILE_WIDTH, PROFILE_HEIGHT
     cx, cy = w * 0.5, h * 0.32
     Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -49,25 +56,17 @@ def get_profile_template() -> Image.Image:
     r_max = float(np.sqrt(cx**2 + cy**2) * 1.05)
     t = np.clip(dist / r_max, 0.0, 1.0)
 
-    # RGB — bright blue behind head, darker corners (engage4more-style).
     center = np.array([55.0, 95.0, 165.0], dtype=np.float32)
     edge = np.array([8.0, 18.0, 42.0], dtype=np.float32)
     img = np.zeros((h, w, 3), dtype=np.float32)
     for c in range(3):
         img[:, :, c] = center[c] * (1.0 - t) + edge[c] * t
 
-    # Vertical darken toward bottom (before black gradation asset).
     y_norm = np.linspace(0.0, 1.0, h, dtype=np.float32)
     bottom_fade = np.clip((y_norm - 0.42) / 0.58, 0.0, 1.0).reshape(h, 1, 1)
     img *= 1.0 - bottom_fade * 0.55
 
-    base = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), mode="RGB").convert("RGBA")
-
-    if os.path.isfile(BLACK_GRADIENT_REFERENCE_PATH):
-        overlay = Image.open(BLACK_GRADIENT_REFERENCE_PATH).convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
-        base = Image.alpha_composite(base, overlay)
-
-    return base.convert("RGB")
+    return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), mode="RGB")
 
 
 def _ensure_face_landmarker_model() -> None:
@@ -96,7 +95,6 @@ def _get_face_landmarker() -> FaceLandmarker:
 
 
 def _face_metrics_mediapipe(rgb: np.ndarray) -> tuple[float, float, float] | None:
-    """Return (hairline_y, chin_y, center_x) in pixel coordinates."""
     h, w = rgb.shape[:2]
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     result = _get_face_landmarker().detect(mp_image)
@@ -104,13 +102,13 @@ def _face_metrics_mediapipe(rgb: np.ndarray) -> tuple[float, float, float] | Non
         return None
 
     lm = result.face_landmarks[0]
-    chin_y = lm[152].y * h
-    forehead_y = lm[10].y * h
-    face_len = max(chin_y - forehead_y, 1.0)
-    hairline_y = forehead_y - HAIRLINE_EXTENSION * face_len
+    chin_y = lm[_CHIN_INDEX].y * h
+    cranial_top_y = min(lm[i].y for i in _CRANIAL_TOP_INDICES) * h
+    face_len = max(chin_y - cranial_top_y, 1.0)
+    hairline_y = cranial_top_y - _HAIR_ABOVE_MESH * face_len
 
-    left_x = lm[234].x * w
-    right_x = lm[454].x * w
+    left_x = lm[_LEFT_TEMPLE_INDEX].x * w
+    right_x = lm[_RIGHT_TEMPLE_INDEX].x * w
     center_x = (left_x + right_x) / 2.0
 
     return (hairline_y, chin_y, center_x)
@@ -133,6 +131,31 @@ def _face_metrics_haar_fallback(rgb: np.ndarray) -> tuple[float, float, float] |
     return (hairline_y, chin_y, center_x)
 
 
+# Max allowed landmark drift after alignment (pixels on final 765×480).
+GUIDE_TOLERANCE_PX = 3.0
+MAX_ALIGN_PASSES = 5
+
+
+def face_guide_errors(image: Image.Image) -> tuple[float, float, float]:
+    """Pixel error vs guides: (hairline_y, chin_y, center_x)."""
+    hairline_y, chin_y, center_x = detect_face_metrics(image)
+    return (
+        hairline_y - GUIDE_TOP_Y,
+        chin_y - GUIDE_BOTTOM_Y,
+        center_x - GUIDE_CENTER_X,
+    )
+
+
+def is_face_on_guides(image: Image.Image, tolerance: float = GUIDE_TOLERANCE_PX) -> bool:
+    """True if detected face band and center are within tolerance of designer guides."""
+    top_err, chin_err, cx_err = face_guide_errors(image)
+    return (
+        abs(top_err) <= tolerance
+        and abs(chin_err) <= tolerance
+        and abs(cx_err) <= tolerance
+    )
+
+
 def detect_face_metrics(image: Image.Image) -> tuple[float, float, float]:
     rgb = np.asarray(image.convert("RGB"))
     metrics = _face_metrics_mediapipe(rgb)
@@ -142,6 +165,51 @@ def detect_face_metrics(image: Image.Image) -> tuple[float, float, float]:
         w, h = image.size
         return (h * 0.15, h * 0.55, w / 2.0)
     return metrics
+
+
+def _sample_background_color(image: Image.Image) -> tuple[int, int, int]:
+    """Median color from upper band (headroom area) for letterbox padding."""
+    w, h = image.size
+    band_h = max(8, min(int(h * 0.22), h))
+    patch = np.array(image.crop((0, 0, w, band_h)).convert("RGB"))
+    median = np.median(patch.reshape(-1, 3), axis=0)
+    return tuple(int(v) for v in median)
+
+
+def align_geometric_preserve_background(
+    source: Image.Image,
+    metrics: tuple[float, float, float],
+) -> Image.Image:
+    """
+    Exact uniform scale + translate (affine) so that:
+      hairline_y → GUIDE_TOP_Y (74)
+      chin_y     → GUIDE_BOTTOM_Y (303)
+      center_x   → GUIDE_CENTER_X (382.5)
+
+    Scale s = 229 / (chin_y - hairline_y). Image is scaled up or down as needed.
+    """
+    hairline_y, chin_y, center_x = metrics
+    face_h = max(chin_y - hairline_y, 1.0)
+    scale = FACE_BAND_HEIGHT / face_h
+
+    tx = GUIDE_CENTER_X - scale * center_x
+    ty = GUIDE_TOP_Y - scale * hairline_y
+
+    rgb = np.asarray(source.convert("RGB"))
+    bg = _sample_background_color(source)
+    border_bgr = (int(bg[2]), int(bg[1]), int(bg[0]))
+
+    matrix = np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    warped = cv2.warpAffine(
+        bgr,
+        matrix,
+        (PROFILE_WIDTH, PROFILE_HEIGHT),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border_bgr,
+    )
+    return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
 
 
 def remove_background_rgba(image: Image.Image) -> Image.Image:
@@ -159,6 +227,7 @@ def align_cutout_on_template(
     *,
     template: Image.Image | None = None,
 ) -> Image.Image:
+    """Fallback: rembg cutout on synthetic template (discouraged for final output)."""
     hairline_y, chin_y, center_x = metrics
     face_h = max(chin_y - hairline_y, 1.0)
     scale = FACE_BAND_HEIGHT / face_h
@@ -179,10 +248,22 @@ def align_cutout_on_template(
 
 def align_profile_to_grid(image_bytes: bytes) -> Image.Image:
     """
-    Full pipeline: load image → detect face → cut out subject → align on template.
-    Returns 765×480 RGB PIL Image.
+    Align face to guides on a 765×480 canvas.
+    Preserves the full Gemini render (background + bottom fade); no rembg by default.
+    Repeats until landmarks sit on guides (≤3 px) or MAX_ALIGN_PASSES.
     """
-    source = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    metrics = detect_face_metrics(source)
-    cutout = remove_background_rgba(source)
-    return align_cutout_on_template(cutout, metrics)
+    current = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    result = current
+    for pass_idx in range(MAX_ALIGN_PASSES):
+        metrics = detect_face_metrics(current)
+        result = align_geometric_preserve_background(current, metrics)
+        if is_face_on_guides(result):
+            break
+        current = result
+        if pass_idx == MAX_ALIGN_PASSES - 1:
+            top_e, chin_e, cx_e = face_guide_errors(result)
+            print(
+                f"[profile_align] warning after {MAX_ALIGN_PASSES} passes: "
+                f"hairline {top_e:+.1f}px, chin {chin_e:+.1f}px, center {cx_e:+.1f}px"
+            )
+    return result
