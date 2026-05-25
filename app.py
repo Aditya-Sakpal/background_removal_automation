@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from google_images import (
     DEFAULT_TARGET_ASPECT,
@@ -41,6 +41,17 @@ VIGNETTE_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "zakir-khan_Co
 BLACK_GRADIENT_REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "black_gradient_reference.png")
 PROFILE_WIDTH = 765
 PROFILE_HEIGHT = 480
+GUIDE_TOP_Y = 74  # hairline / top of head (designer grid)
+GUIDE_BOTTOM_Y = 303  # chin (designer grid)
+GUIDE_CENTER_X = PROFILE_WIDTH / 2.0
+FACE_BAND_HEIGHT = GUIDE_BOTTOM_Y - GUIDE_TOP_Y
+# Testing overlay: cyan Y=74, Y=303, center X=382.5 (PROFILE_SHOW_GUIDE_LINES=0 to hide)
+PROFILE_SHOW_GUIDE_LINES = os.getenv("PROFILE_SHOW_GUIDE_LINES", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 PROFILE_MAX_SIZE_KB = 50
 GALLERY_WIDTH = 1176
 GALLERY_HEIGHT = 516
@@ -681,6 +692,28 @@ def apply_profile_alignment(image_bytes: bytes) -> tuple[bytes, bool, str | None
     return image_bytes, False, last_err
 
 
+def draw_profile_guide_lines(img: Image.Image) -> Image.Image:
+    """Cyan guides: Y=74, Y=303, vertical center X=382.5 (scaled to image size)."""
+    out = img.convert("RGB").copy()
+    w, h = out.size
+    top_y = round(GUIDE_TOP_Y * h / PROFILE_HEIGHT)
+    bottom_y = round(GUIDE_BOTTOM_Y * h / PROFILE_HEIGHT)
+    center_x = round(GUIDE_CENTER_X * w / PROFILE_WIDTH)
+    draw = ImageDraw.Draw(out)
+    draw.line([(0, top_y), (w, top_y)], fill=(0, 255, 255), width=2)
+    draw.line([(0, bottom_y), (w, bottom_y)], fill=(0, 255, 255), width=2)
+    draw.line([(center_x, 0), (center_x, h)], fill=(0, 255, 255), width=2)
+    return out
+
+
+def profile_image_for_display(image_bytes: bytes) -> Image.Image:
+    """PIL image for Streamlit preview; adds guide lines when PROFILE_SHOW_GUIDE_LINES is on."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if PROFILE_SHOW_GUIDE_LINES:
+        return draw_profile_guide_lines(img)
+    return img
+
+
 def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
     """
     Profile banner → align face to guides (74–303 Y, center X) then WebP.
@@ -896,7 +929,7 @@ def generate_linkedin_image(
         pass
 
     # 4. Generation prompt — composition rules + explicit identity anchor.
-    prompt_text = """🚨 PRIMARY INSTRUCTION (READ FIRST, OVERRIDES EVERYTHING ELSE) 🚨
+    prompt_text = f"""🚨 PRIMARY INSTRUCTION (READ FIRST, OVERRIDES EVERYTHING ELSE) 🚨
 
 The last image in this input is a photo of ZAKIR KHAN (an Indian stand-up comedian). His image is provided STRICTLY AS A REFERENCE for the COMPOSITION ONLY. He is there for inspiration on how the layout / framing / background should look — that is the ONLY thing you should take from his image.
 
@@ -921,8 +954,8 @@ IDENTITY (read this first — most common failure mode):
 TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING (most important rule):
 - Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame. The subject's head + shoulders should occupy only the LOWER PORTION of the image, NOT fill the entire frame from top to bottom.
 - Think medium-wide shot, not close-up. The camera is pulled back further than a typical headshot. The hair, face, neck, and shoulders together take roughly the lower 65-75% of the frame — never more.
-- The upper ~25-30% of the frame must be pure background with NO part of the subject in it.
-- The eyes should sit at or slightly BELOW the horizontal midline of the frame (around 50-60% down from the top), NOT in the upper third.
+- The upper portion of the frame (above Y={GUIDE_TOP_Y}) must be pure background with NO part of the subject in it.
+- Face placement is defined by the designer grid below (hairline Y={GUIDE_TOP_Y}, chin Y={GUIDE_BOTTOM_Y}) — not by eye-line heuristics.
 - IMPORTANT — do NOT try to add headroom by simply translating the subject downward in a tight crop. That just cuts off the shoulders/torso at the bottom. Instead, SHRINK the subject by zooming out — the subject must appear visibly smaller, with both empty background above the head AND the full shoulders/upper torso visible below.
 - FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head or the shoulders.
 
@@ -940,16 +973,31 @@ Background — vertical gradient + radial vignette (match the canonical referenc
 - The transitions (both vertical gradient and radial vignette) must be smooth — no banding, no hard lines.
 - Net effect: the corners are dark, the bottom is darker still (fading into the subject's lower clothing), and the area behind the head has a softly-lit "halo" that draws the eye to the face.
 
-Composition (landscape 3:2):
-- The face (hairline to chin) takes around 20-30% of the frame's vertical height — smaller than a typical headshot. This is a ZOOMED-OUT framing.
-- The full subject from top-of-hair to upper-torso fits inside the lower two-thirds of the frame, leaving the top third as empty background.
-- The subject is centred horizontally — equal background on left and right.
-- Both shoulders are fully visible with a small margin, and the collar/neckline of the clothing is visible at the bottom.
+Composition (landscape 3:2, exactly {PROFILE_WIDTH}×{PROFILE_HEIGHT} pixels):
+
+MANDATORY FACE POSITION — designer grid (non-negotiable; post-processing depends on this):
+- Output image size: exactly {PROFILE_WIDTH} pixels wide × {PROFILE_HEIGHT} pixels tall.
+- Measure from the TOP-LEFT corner (0,0). Y increases downward.
+- Top of hair / hairline must sit at Y = {GUIDE_TOP_Y} (not higher, not lower — not Y=70 or Y=80).
+- Bottom of chin must sit at Y = {GUIDE_BOTTOM_Y} (not Y=295 or Y=310).
+- The face vertical span from hairline to chin must be {FACE_BAND_HEIGHT} pixels ({GUIDE_BOTTOM_Y} minus {GUIDE_TOP_Y}).
+- Horizontal centre of the face (midpoint between temples / centre of nose) must be at X = {GUIDE_CENTER_X} (horizontal centre of frame).
+- Leave empty background above the hairline down to the top edge (pixels Y=0 to Y={GUIDE_TOP_Y}).
+- Shoulders and upper torso extend below the chin; black gradient may cover lower clothing.
+- If the face is too large, ZOOM OUT until hairline and chin hit these Y coordinates. If too small, ZOOM IN until they match.
+- Do NOT place the face by "eye line at mid-frame" rules — use the Y={GUIDE_TOP_Y} and Y={GUIDE_BOTTOM_Y} coordinates above.
+
+Additional framing:
+- The full subject from top-of-hair to upper-torso fits inside the frame without cropping the top of the head or shoulders.
+- Equal background on left and right of the centred face.
 - A slightly angled pose works well; avoid a straight-on stare.
 
-Self-check before finishing: cover the lower half of your output with your hand — the upper half should show clear background above the head, with the head sitting mostly in the lower half of the frame. If the head dominates the upper half OR if the shoulders are cropped at the bottom, you've zoomed in too tight — pull the camera back further so the subject takes up less of the frame.
+Self-check before finishing:
+1. Is the person the SUBJECT from the upload photos (not Zakir Khan)?
+2. Hairline at Y≈{GUIDE_TOP_Y}, chin at Y≈{GUIDE_BOTTOM_Y}, face centred at X≈{GUIDE_CENTER_X} on a {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas?
+3. Clear background band above the hair (above Y={GUIDE_TOP_Y})?
 
-Output one bright, polished landscape headshot at 3:2."""
+Output one bright, polished landscape headshot at 3:2 ({PROFILE_WIDTH}×{PROFILE_HEIGHT})."""
 
     if custom_prompt:
         prompt_text += f"""
@@ -1991,7 +2039,8 @@ if st.button("Generate Image", type="primary", width="stretch"):
         "SUBJECT PHOTOS as the identity source. The person in the output must "
         "be the user-provided subject — NOT Zakir Khan. Do NOT copy Zakir Khan's "
         "face, beard, hair, ethnicity, or any visual feature from the composition "
-        "reference."
+        "reference. Keep the designer face grid: hairline at Y=74, chin at Y=303, "
+        "face centred at X=382.5 on a 765×480 canvas."
     )
 
     profile_candidates: list[bytes] = []
@@ -2060,12 +2109,22 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     else:
                         st.write("  ✅ Face aligned to guides (765×480, background preserved)")
                     profile_candidates.append(aligned_bytes)
+                    preview_bytes = aligned_bytes
                 else:
                     st.warning(
                         "  ⚠ Alignment failed — showing raw Gemini output for this candidate. "
                         f"**Reason:** {align_err or 'unknown'}"
                     )
                     profile_candidates.append(candidate_img)
+                    preview_bytes = candidate_img
+                st.image(
+                    profile_image_for_display(preview_bytes),
+                    caption=(
+                        f"Candidate {i} preview — cyan: Y={GUIDE_TOP_Y}, Y={GUIDE_BOTTOM_Y}, "
+                        f"center X={GUIDE_CENTER_X:.0f}"
+                    ),
+                    width="stretch",
+                )
             else:
                 st.warning(f"Candidate {i} produced no image.")
 
@@ -2104,10 +2163,16 @@ if (
 ):
     st.divider()
     st.subheader("Pick your profile image")
+    guide_caption = (
+        f" — cyan: Y={GUIDE_TOP_Y}, Y={GUIDE_BOTTOM_Y}, center X={GUIDE_CENTER_X:.0f}"
+        if PROFILE_SHOW_GUIDE_LINES
+        else ""
+    )
     st.caption(
         f"Generated {len(st.session_state.profile_candidates)} candidate profile images "
         "(face aligned to designer guides on 765×480; Gemini gradient/background kept). "
         "Choose the one you like best — it becomes profile.webp and the gallery face anchor."
+        + guide_caption
     )
 
     candidates = st.session_state.profile_candidates
@@ -2115,8 +2180,8 @@ if (
     for i, img_bytes in enumerate(candidates):
         with cols[i]:
             st.image(
-                Image.open(io.BytesIO(img_bytes)),
-                caption=f"Candidate {i + 1}",
+                profile_image_for_display(img_bytes),
+                caption=f"Candidate {i + 1}{guide_caption}",
                 width="stretch",
             )
 
@@ -2321,7 +2386,16 @@ if result_data:
     all_outputs = [("profile.webp", profile_webp_bytes)] + [(name, data) for name, data, _ in gallery_outputs]
     for idx, (name, data) in enumerate(all_outputs):
         with preview_cols[idx % 3]:
-            st.image(Image.open(io.BytesIO(data)), caption=f"{name} ({len(data)/1024:.1f} KB)", width="stretch")
+            if name == "profile.webp":
+                preview_img = profile_image_for_display(data)
+                cap = (
+                    f"{name} ({len(data)/1024:.1f} KB) — cyan: Y={GUIDE_TOP_Y}, "
+                    f"Y={GUIDE_BOTTOM_Y}, center X={GUIDE_CENTER_X:.0f}"
+                )
+            else:
+                preview_img = Image.open(io.BytesIO(data))
+                cap = f"{name} ({len(data)/1024:.1f} KB)"
+            st.image(preview_img, caption=cap, width="stretch")
 
     st.download_button(
         label="Download All Images (ZIP)",
