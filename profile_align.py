@@ -247,60 +247,6 @@ def _sample_background_color(image: Image.Image) -> tuple[int, int, int]:
     return tuple(int(v) for v in median)
 
 
-def _cover_background_bgr(source: Image.Image) -> np.ndarray:
-    """
-    Scale/crop source to 765×480 (cover) so margins can match Gemini gradient
-    instead of a flat letterbox color after face-align warp.
-    """
-    sw, sh = source.size
-    scale = max(PROFILE_WIDTH / sw, PROFILE_HEIGHT / sh)
-    nw = max(PROFILE_WIDTH, int(round(sw * scale)))
-    nh = max(PROFILE_HEIGHT, int(round(sh * scale)))
-    enlarged = source.resize((nw, nh), Image.Resampling.LANCZOS)
-    left = (nw - PROFILE_WIDTH) // 2
-    top = (nh - PROFILE_HEIGHT) // 2
-    crop = enlarged.crop((left, top, left + PROFILE_WIDTH, top + PROFILE_HEIGHT))
-    return cv2.cvtColor(np.asarray(crop.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-
-def _flat_border_mask(
-    bgr: np.ndarray,
-    border_bgr: tuple[int, int, int],
-    *,
-    tolerance: int = 14,
-) -> np.ndarray:
-    """True where warpAffine filled with a constant border (letterbox bands)."""
-    border = np.array(border_bgr, dtype=np.int16)
-    diff = np.abs(bgr.astype(np.int16) - border).max(axis=2)
-    return diff <= tolerance
-
-
-def _repair_warp_margins(
-    warped_bgr: np.ndarray,
-    source: Image.Image,
-    border_bgr: tuple[int, int, int],
-) -> np.ndarray:
-    """
-    Replace flat letterbox fills with a cover-scaled background from the same image,
-    then lightly inpaint the seam so the inner 'card' border disappears.
-    """
-    margin = _flat_border_mask(warped_bgr, border_bgr)
-    if not margin.any():
-        return warped_bgr
-
-    bg_bgr = _cover_background_bgr(source)
-    out = warped_bgr.copy()
-    out[margin] = bg_bgr[margin]
-
-    # Feather seam: inpaint a thin ring around the margin/content boundary.
-    margin_u8 = margin.astype(np.uint8) * 255
-    seam = cv2.dilate(margin_u8, np.ones((7, 7), np.uint8), iterations=1)
-    seam = cv2.bitwise_and(seam, cv2.bitwise_not(margin_u8))
-    if int(seam.sum()) > 0:
-        out = cv2.inpaint(out, seam, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
-    return out
-
-
 def align_geometric_preserve_background(
     source: Image.Image,
     metrics: tuple[float, float, float],
@@ -334,13 +280,6 @@ def align_geometric_preserve_background(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=border_bgr,
     )
-    if os.getenv("PROFILE_ALIGN_REPAIR_MARGINS", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        warped = _repair_warp_margins(warped, source, border_bgr)
     return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
 
 

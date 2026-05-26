@@ -52,6 +52,13 @@ PROFILE_SHOW_GUIDE_LINES = os.getenv("PROFILE_SHOW_GUIDE_LINES", "true").strip()
     "no",
     "off",
 )
+# After face alignment, Gemini pass to remove warp padding / double-background seams.
+PROFILE_UNIFORM_BACKGROUND = os.getenv("PROFILE_UNIFORM_BACKGROUND", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 PROFILE_MAX_SIZE_KB = 50
 GALLERY_WIDTH = 1176
 GALLERY_HEIGHT = 516
@@ -727,17 +734,29 @@ def profile_image_for_display(image_bytes: bytes) -> Image.Image:
 
 def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
     """
-    Profile banner → align face to guides (74–303 Y, center X) then WebP.
-    Always verifies guides — never skips alignment just because size is 765×480.
+    Profile banner → WebP. Skips re-align when already 765×480 on guides (post-uniform
+    candidates) so Gemini background fix is not overwritten by warp padding.
     """
     try:
         from profile_align import align_profile_to_grid, is_face_on_guides
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        if img.size == (PROFILE_WIDTH, PROFILE_HEIGHT) and is_face_on_guides(img):
+            return _encode_rgb_to_webp(img, PROFILE_MAX_SIZE_KB)
 
         aligned = align_profile_to_grid(image_bytes)
         if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
             aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
         if not is_face_on_guides(aligned):
             print("[profile_align] warning: face still off guides after alignment")
+        if PROFILE_UNIFORM_BACKGROUND:
+            try:
+                buf = io.BytesIO()
+                aligned.save(buf, format="PNG")
+                fixed = uniform_profile_background_gemini(buf.getvalue())
+                aligned = Image.open(io.BytesIO(fixed)).convert("RGB")
+            except Exception as e:
+                print(f"[profile] background uniform after align failed: {e}")
         return _encode_rgb_to_webp(aligned, PROFILE_MAX_SIZE_KB)
     except Exception as e:
         print(f"[profile_align] fallback to center crop: {type(e).__name__}: {e}")
@@ -1034,6 +1053,57 @@ Notes from a previous attempt — please address these in this version:
         ),
         context="profile image",
     )
+
+
+def _profile_png_bytes(image_bytes: bytes) -> bytes:
+    """Normalize to 765×480 RGB PNG."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if img.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
+        img = img.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def uniform_profile_background_gemini(aligned_image_bytes: bytes) -> bytes:
+    """
+    Gemini edit pass: remove visible inner frame / flat padding from affine alignment.
+    Keeps the person and face position; only unifies background edge-to-edge.
+    """
+    client = get_gemini_client()
+    src = Image.open(io.BytesIO(aligned_image_bytes)).convert("RGB")
+    if src.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
+        src = src.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+
+    prompt = f"""You are retouching a professional profile banner ({PROFILE_WIDTH}×{PROFILE_HEIGHT} pixels).
+
+PROBLEM: The input has a visible "double background" or inner rectangle — the subject sits inside a smaller photo, and flat or mismatched padding from automated face alignment surrounds it (picture-in-picture / two borders).
+
+YOUR ONLY TASK: Fix the BACKGROUND so the full canvas is one seamless image.
+
+STRICT — DO NOT CHANGE:
+- The person: same face, identity, pose, expression, clothing, hair, lighting on skin.
+- Face position in the frame: hairline near Y={GUIDE_TOP_Y}, chin near Y={GUIDE_BOTTOM_Y}, face centered near X={GUIDE_CENTER_X}. Do NOT move, zoom, or recrop the subject.
+
+YOU MUST:
+- Extend and blend the existing gradient/vignette into all empty or flat border areas.
+- Top: vivid colour behind the head; bottom: smooth fade to black into lower clothing; corners: soft radial vignette — all continuous with the inner area.
+- Zero visible rectangular frame, seam, or second background colour band anywhere on the canvas.
+- Output exactly {PROFILE_WIDTH}×{PROFILE_HEIGHT}, landscape 3:2, edge-to-edge unified background.
+
+Do not add text, logos, watermarks, or extra objects."""
+
+    out_bytes = call_gemini_with_retry(
+        client,
+        model=GEMINI_MODEL,
+        contents=[src, prompt],
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+            image_config=types.ImageConfig(aspect_ratio="3:2"),
+        ),
+        context="profile background uniform",
+    )
+    return _profile_png_bytes(out_bytes)
 
 
 def generate_gallery_image(
@@ -2062,7 +2132,7 @@ if st.button("Generate Image", type="primary", width="stretch"):
     profile_candidates: list[bytes] = []
     with st.status(
         f"Step 2 — Generating {NUM_PROFILE_CANDIDATES} profile candidates "
-        f"(Gemini → align face to guides; Zakir check + up to {ZAKIR_MAX_RETRIES} retries each)...",
+        f"(Gemini → align → background uniform; Zakir check + up to {ZAKIR_MAX_RETRIES} retries each)...",
         expanded=True,
     ) as status:
         for i in range(1, NUM_PROFILE_CANDIDATES + 1):
@@ -2151,6 +2221,35 @@ if st.button("Generate Image", type="primary", width="stretch"):
             )
             st.error("All profile candidate generations failed. Try again.")
             st.stop()
+
+        # Step 2b: Gemini pass on all candidates — seamless background (no double frame).
+        if PROFILE_UNIFORM_BACKGROUND:
+            st.markdown("**Background uniforming (Gemini)**")
+            uniformed_candidates: list[bytes] = []
+            for j, cand_bytes in enumerate(profile_candidates, 1):
+                with st.spinner(
+                    f"  Candidate {j}/{len(profile_candidates)} — seamless background..."
+                ):
+                    try:
+                        fixed = uniform_profile_background_gemini(cand_bytes)
+                        uniformed_candidates.append(fixed)
+                        st.write(f"  ✅ Candidate {j} background unified")
+                    except Exception as e:
+                        st.warning(
+                            f"  ⚠ Candidate {j} background uniform failed ({e}) "
+                            "— using aligned version"
+                        )
+                        uniformed_candidates.append(_profile_png_bytes(cand_bytes))
+                st.image(
+                    profile_image_for_display(uniformed_candidates[-1]),
+                    caption=(
+                        f"Candidate {j} after background uniform — "
+                        f"Y={GUIDE_TOP_Y}, Y={GUIDE_BOTTOM_Y}, X={GUIDE_CENTER_X:.0f}"
+                    ),
+                    width="stretch",
+                )
+            profile_candidates = uniformed_candidates
+
         status.update(
             label=f"Step 2 — Generated {len(profile_candidates)}/{NUM_PROFILE_CANDIDATES} candidates",
             state="complete",
@@ -2186,7 +2285,7 @@ if (
     )
     st.caption(
         f"Generated {len(st.session_state.profile_candidates)} candidate profile images "
-        "(face aligned to designer guides on 765×480; Gemini gradient/background kept). "
+        "(face aligned to guides, then Gemini background uniform on 765×480). "
         "Choose the one you like best — it becomes profile.webp and the gallery face anchor."
         + guide_caption
     )
