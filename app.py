@@ -633,16 +633,27 @@ def _encode_rgb_to_webp(img: Image.Image, max_size_kb: int) -> tuple[bytes, bool
 
 
 def check_profile_align_ready() -> tuple[bool, str]:
-    """Verify mediapipe + face landmarker model are available before alignment."""
+    """Verify face alignment backend (MediaPipe or OpenCV-only on Render)."""
     try:
-        import mediapipe  # noqa: F401
-        from profile_align import ensure_face_landmarker_model
-
-        ensure_face_landmarker_model()
-    except ImportError:
-        return False, "mediapipe is not installed. Run: pip install -r requirements.txt (Python 3.12)."
+        from profile_align import (
+            _use_mediapipe_detection,
+            ensure_face_landmarker_model,
+            verify_opencv_face_detection,
+        )
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"profile_align unavailable: {type(e).__name__}: {e}"
+
+    if _use_mediapipe_detection():
+        try:
+            ensure_face_landmarker_model()
+        except ImportError:
+            return False, "mediapipe is not installed. Run: pip install -r requirements.txt (Python 3.12)."
+        except Exception as e:
+            return False, f"MediaPipe: {type(e).__name__}: {e}"
+    else:
+        ok, err = verify_opencv_face_detection()
+        if not ok:
+            return False, err
     return True, ""
 
 
@@ -1670,11 +1681,16 @@ st.caption(
 
 _align_ok, _align_msg = check_profile_align_ready()
 if _align_ok:
-    _mp_note = (
-        "OpenCV face detection (Render-safe)"
-        if os.getenv("RENDER") or os.getenv("PROFILE_ALIGN_USE_MEDIAPIPE", "").strip() in ("0", "false")
-        else "MediaPipe + OpenCV"
-    )
+    try:
+        from profile_align import _use_mediapipe_detection
+
+        _mp_note = (
+            "MediaPipe + OpenCV"
+            if _use_mediapipe_detection()
+            else "OpenCV only (Render — PROFILE_ALIGN_USE_MEDIAPIPE=0)"
+        )
+    except Exception:
+        _mp_note = "OpenCV"
     st.caption(f"Face alignment: ready (guides Y 74–303, center X 382.5) — {_mp_note}.")
 else:
     st.warning(f"Face alignment not ready — {_align_msg}")

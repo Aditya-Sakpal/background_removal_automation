@@ -8,6 +8,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
+      - key: RENDER
+        value: "true"
       - key: PROFILE_ALIGN_USE_MEDIAPIPE
         value: "0"
       - key: GEMINI_API_KEY

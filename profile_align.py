@@ -17,10 +17,7 @@ from functools import lru_cache
 _ALIGN_MAX_EDGE = int(os.getenv("PROFILE_ALIGN_MAX_EDGE", "1920"))
 
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
 from PIL import Image
 
 PROFILE_WIDTH = 765
@@ -46,7 +43,7 @@ _RIGHT_TEMPLE_INDEX = 454
 # Nudge above mesh cranial top to include visible hair (fraction of face height).
 _HAIR_ABOVE_MESH = 0.04
 
-_face_landmarker: FaceLandmarker | None = None
+_face_landmarker = None  # lazy FaceLandmarker when MediaPipe enabled
 
 
 @lru_cache(maxsize=1)
@@ -81,9 +78,13 @@ def _ensure_face_landmarker_model() -> None:
     urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, FACE_LANDMARKER_MODEL_PATH)
 
 
-def _get_face_landmarker() -> FaceLandmarker:
+def _get_face_landmarker():
+    """Load MediaPipe FaceLandmarker on first use (skipped on Render when MP disabled)."""
     global _face_landmarker
     if _face_landmarker is None:
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
+
         _ensure_face_landmarker_model()
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL_PATH),
@@ -97,13 +98,15 @@ def _get_face_landmarker() -> FaceLandmarker:
     return _face_landmarker
 
 
-def _rgb_for_mediapipe(image: Image.Image) -> np.ndarray:
-    """Contiguous uint8 RGB array — avoids MediaPipe Image __del__ errors on some hosts."""
+def _rgb_array(image: Image.Image) -> np.ndarray:
+    """Contiguous uint8 RGB array for face detection."""
     arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
     return np.ascontiguousarray(arr)
 
 
 def _face_metrics_mediapipe(rgb: np.ndarray) -> tuple[float, float, float] | None:
+    import mediapipe as mp
+
     h, w = rgb.shape[:2]
     if rgb.dtype != np.uint8:
         rgb = rgb.astype(np.uint8)
@@ -179,7 +182,9 @@ def is_face_on_guides(image: Image.Image, tolerance: float = GUIDE_TOLERANCE_PX)
 
 
 def ensure_face_landmarker_model() -> None:
-    """Download face_landmarker.task if missing (call once at app startup)."""
+    """Download model + init FaceLandmarker (only when MediaPipe detection is enabled)."""
+    if not _use_mediapipe_detection():
+        return
     _ensure_face_landmarker_model()
     _get_face_landmarker()
 
@@ -197,6 +202,15 @@ def _use_mediapipe_detection() -> bool:
     return not bool(os.getenv("RENDER"))
 
 
+def verify_opencv_face_detection() -> tuple[bool, str]:
+    """Smoke-test OpenCV Haar cascade (used on Render when MediaPipe is off)."""
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    cascade = cv2.CascadeClassifier(cascade_path)
+    if cascade.empty():
+        return False, f"OpenCV Haar cascade not found at {cascade_path}"
+    return True, ""
+
+
 def _downscale_if_needed(image: Image.Image, max_edge: int = _ALIGN_MAX_EDGE) -> Image.Image:
     w, h = image.size
     if max(w, h) <= max_edge:
@@ -209,7 +223,7 @@ def _downscale_if_needed(image: Image.Image, max_edge: int = _ALIGN_MAX_EDGE) ->
 
 
 def detect_face_metrics(image: Image.Image) -> tuple[float, float, float]:
-    rgb = _rgb_for_mediapipe(image)
+    rgb = _rgb_array(image)
     metrics = None
     if _use_mediapipe_detection():
         try:
@@ -231,6 +245,60 @@ def _sample_background_color(image: Image.Image) -> tuple[int, int, int]:
     patch = np.array(image.crop((0, 0, w, band_h)).convert("RGB"))
     median = np.median(patch.reshape(-1, 3), axis=0)
     return tuple(int(v) for v in median)
+
+
+def _cover_background_bgr(source: Image.Image) -> np.ndarray:
+    """
+    Scale/crop source to 765×480 (cover) so margins can match Gemini gradient
+    instead of a flat letterbox color after face-align warp.
+    """
+    sw, sh = source.size
+    scale = max(PROFILE_WIDTH / sw, PROFILE_HEIGHT / sh)
+    nw = max(PROFILE_WIDTH, int(round(sw * scale)))
+    nh = max(PROFILE_HEIGHT, int(round(sh * scale)))
+    enlarged = source.resize((nw, nh), Image.Resampling.LANCZOS)
+    left = (nw - PROFILE_WIDTH) // 2
+    top = (nh - PROFILE_HEIGHT) // 2
+    crop = enlarged.crop((left, top, left + PROFILE_WIDTH, top + PROFILE_HEIGHT))
+    return cv2.cvtColor(np.asarray(crop.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _flat_border_mask(
+    bgr: np.ndarray,
+    border_bgr: tuple[int, int, int],
+    *,
+    tolerance: int = 14,
+) -> np.ndarray:
+    """True where warpAffine filled with a constant border (letterbox bands)."""
+    border = np.array(border_bgr, dtype=np.int16)
+    diff = np.abs(bgr.astype(np.int16) - border).max(axis=2)
+    return diff <= tolerance
+
+
+def _repair_warp_margins(
+    warped_bgr: np.ndarray,
+    source: Image.Image,
+    border_bgr: tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Replace flat letterbox fills with a cover-scaled background from the same image,
+    then lightly inpaint the seam so the inner 'card' border disappears.
+    """
+    margin = _flat_border_mask(warped_bgr, border_bgr)
+    if not margin.any():
+        return warped_bgr
+
+    bg_bgr = _cover_background_bgr(source)
+    out = warped_bgr.copy()
+    out[margin] = bg_bgr[margin]
+
+    # Feather seam: inpaint a thin ring around the margin/content boundary.
+    margin_u8 = margin.astype(np.uint8) * 255
+    seam = cv2.dilate(margin_u8, np.ones((7, 7), np.uint8), iterations=1)
+    seam = cv2.bitwise_and(seam, cv2.bitwise_not(margin_u8))
+    if int(seam.sum()) > 0:
+        out = cv2.inpaint(out, seam, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+    return out
 
 
 def align_geometric_preserve_background(
@@ -266,6 +334,13 @@ def align_geometric_preserve_background(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=border_bgr,
     )
+    if os.getenv("PROFILE_ALIGN_REPAIR_MARGINS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        warped = _repair_warp_margins(warped, source, border_bgr)
     return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
 
 
