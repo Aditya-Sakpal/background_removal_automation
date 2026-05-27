@@ -34,6 +34,11 @@ FACE_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+YUNET_MODEL_PATH = os.path.join(_DIR, "face_detection_yunet_2023mar.onnx")
+YUNET_MODEL_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
+    "face_detection_yunet_2023mar.onnx"
+)
 
 # MediaPipe indices for top-of-head band (used for hairline Y = guide top).
 _CRANIAL_TOP_INDICES = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288)
@@ -139,19 +144,57 @@ def _face_metrics_mediapipe(rgb: np.ndarray) -> tuple[float, float, float] | Non
     return (hairline_y, chin_y, center_x)
 
 
+def _ensure_yunet_model() -> None:
+    if os.path.isfile(YUNET_MODEL_PATH):
+        return
+    import urllib.request
+
+    print(f"[profile_align] Downloading YuNet model to {YUNET_MODEL_PATH} ...")
+    urllib.request.urlretrieve(YUNET_MODEL_URL, YUNET_MODEL_PATH)
+
+
+def _face_metrics_yunet(rgb: np.ndarray) -> tuple[float, float, float] | None:
+    """YuNet DNN — much more stable than Haar on Render for hairline/chin estimates."""
+    _ensure_yunet_model()
+    h, w = rgb.shape[:2]
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    detector = cv2.FaceDetectorYN.create(YUNET_MODEL_PATH, "", (w, h), 0.6, 0.3, 5000)
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(bgr)
+    if faces is None or len(faces) == 0:
+        return None
+    scores = faces[:, 14]
+    face = faces[int(np.argmax(scores))]
+    x, y, fw, fh = face[0:4]
+    re_x, re_y, le_x, le_y, nt_x, nt_y, rcm_x, rcm_y, lcm_x, lcm_y = face[4:14]
+    eye_y = (re_y + le_y) / 2.0
+    mouth_y = (rcm_y + lcm_y) / 2.0
+    mid = max(mouth_y - eye_y, fh * 0.12)
+    hairline_y = eye_y - 1.35 * mid
+    chin_y = mouth_y + 0.95 * mid
+    center_x = float(nt_x)
+    # Clamp to sensible band around bbox
+    hairline_y = min(hairline_y, y + fh * 0.15)
+    chin_y = max(chin_y, y + fh * 0.72)
+    if chin_y - hairline_y < fh * 0.45:
+        hairline_y = y - 0.12 * fh
+        chin_y = y + fh * 1.08
+    return (float(hairline_y), float(chin_y), center_x)
+
+
 def _face_metrics_haar_fallback(rgb: np.ndarray) -> tuple[float, float, float] | None:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
     cascade = cv2.CascadeClassifier(cascade_path)
     if cascade.empty():
         return None
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=4, minSize=(48, 48))
     if faces is None or len(faces) == 0:
         return None
     areas = [int(fw) * int(fh) for (_x, _y, fw, fh) in faces]
     x, y, fw, fh = [int(v) for v in faces[int(np.argmax(areas))]]
-    hairline_y = y - 0.35 * fh
-    chin_y = y + fh
+    hairline_y = y - 0.42 * fh
+    chin_y = y + fh * 1.12
     center_x = x + fw / 2.0
     return (hairline_y, chin_y, center_x)
 
@@ -203,12 +246,25 @@ def _use_mediapipe_detection() -> bool:
 
 
 def verify_opencv_face_detection() -> tuple[bool, str]:
-    """Smoke-test OpenCV Haar cascade (used on Render when MediaPipe is off)."""
+    """Smoke-test YuNet + Haar (used on Render when MediaPipe is off)."""
+    try:
+        _ensure_yunet_model()
+    except Exception as e:
+        return False, f"YuNet model: {e}"
     cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
     cascade = cv2.CascadeClassifier(cascade_path)
     if cascade.empty():
         return False, f"OpenCV Haar cascade not found at {cascade_path}"
     return True, ""
+
+
+def format_guide_errors(image: Image.Image) -> str:
+    """Human-readable alignment error for UI logs."""
+    top_e, chin_e, cx_e = face_guide_errors(image)
+    return (
+        f"hairline {top_e:+.0f}px, chin {chin_e:+.0f}px, center {cx_e:+.0f}px "
+        f"(target Y={GUIDE_TOP_Y}/{GUIDE_BOTTOM_Y}, X={GUIDE_CENTER_X:.0f})"
+    )
 
 
 def _downscale_if_needed(image: Image.Image, max_edge: int = _ALIGN_MAX_EDGE) -> Image.Image:
@@ -229,7 +285,12 @@ def detect_face_metrics(image: Image.Image) -> tuple[float, float, float]:
         try:
             metrics = _face_metrics_mediapipe(rgb)
         except Exception as exc:
-            print(f"[profile_align] MediaPipe detect failed, using OpenCV: {exc}")
+            print(f"[profile_align] MediaPipe detect failed, using YuNet: {exc}")
+    if metrics is None:
+        try:
+            metrics = _face_metrics_yunet(rgb)
+        except Exception as exc:
+            print(f"[profile_align] YuNet detect failed, using Haar: {exc}")
     if metrics is None:
         metrics = _face_metrics_haar_fallback(rgb)
     if metrics is None:
@@ -268,19 +329,25 @@ def align_geometric_preserve_background(
 
     rgb = np.asarray(source.convert("RGB"))
     bg = _sample_background_color(source)
-    border_bgr = (int(bg[2]), int(bg[1]), int(bg[0]))
 
     matrix = np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    # REFLECT reduces harsh flat "picture-in-picture" bars vs BORDER_CONSTANT fill.
     warped = cv2.warpAffine(
         bgr,
         matrix,
         (PROFILE_WIDTH, PROFILE_HEIGHT),
         flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=border_bgr,
+        borderMode=cv2.BORDER_REFLECT_101,
     )
-    return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+    # Feather outer 2% edge from sampled headroom colour (softens any remaining seam).
+    out = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+    edge = max(2, int(min(PROFILE_WIDTH, PROFILE_HEIGHT) * 0.02))
+    out[:edge, :] = bg
+    out[-edge:, :] = bg
+    out[:, :edge] = bg
+    out[:, -edge:] = bg
+    return Image.fromarray(out)
 
 
 def remove_background_rgba(image: Image.Image) -> Image.Image:
@@ -332,9 +399,5 @@ def align_profile_to_grid(image_bytes: bytes) -> Image.Image:
             break
         current = result
         if pass_idx == MAX_ALIGN_PASSES - 1:
-            top_e, chin_e, cx_e = face_guide_errors(result)
-            print(
-                f"[profile_align] warning after {MAX_ALIGN_PASSES} passes: "
-                f"hairline {top_e:+.1f}px, chin {chin_e:+.1f}px, center {cx_e:+.1f}px"
-            )
+            print(f"[profile_align] warning after {MAX_ALIGN_PASSES} passes: {format_guide_errors(result)}")
     return result

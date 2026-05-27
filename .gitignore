@@ -5,5 +5,6 @@ output/
 venv/
 .venv/
 face_landmarker.task
+face_detection_yunet_2023mar.onnx
 profile_aligned_test.jpg
 profile_template_test.jpg

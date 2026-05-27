@@ -734,21 +734,21 @@ def profile_image_for_display(image_bytes: bytes) -> Image.Image:
 
 def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
     """
-    Profile banner → WebP. Skips re-align when already 765×480 on guides (post-uniform
-    candidates) so Gemini background fix is not overwritten by warp padding.
+    Profile banner → WebP. Never re-align after Gemini background uniform (warp re-adds borders).
+    Picker candidates are already align → uniform at 765×480 — encode only.
     """
     try:
-        from profile_align import align_profile_to_grid, is_face_on_guides
+        from profile_align import align_profile_to_grid, is_face_on_guides, format_guide_errors
 
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        if img.size == (PROFILE_WIDTH, PROFILE_HEIGHT) and is_face_on_guides(img):
+        if img.size == (PROFILE_WIDTH, PROFILE_HEIGHT):
+            if not is_face_on_guides(img):
+                print(f"[profile_align] note (post-uniform, no re-align): {format_guide_errors(img)}")
             return _encode_rgb_to_webp(img, PROFILE_MAX_SIZE_KB)
 
         aligned = align_profile_to_grid(image_bytes)
         if aligned.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
             aligned = aligned.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
-        if not is_face_on_guides(aligned):
-            print("[profile_align] warning: face still off guides after alignment")
         if PROFILE_UNIFORM_BACKGROUND:
             try:
                 buf = io.BytesIO()
@@ -756,7 +756,7 @@ def prepare_profile_webp(image_bytes: bytes) -> tuple[bytes, bool]:
                 fixed = uniform_profile_background_gemini(buf.getvalue())
                 aligned = Image.open(io.BytesIO(fixed)).convert("RGB")
             except Exception as e:
-                print(f"[profile] background uniform after align failed: {e}")
+                print(f"[profile] background uniform failed: {e}")
         return _encode_rgb_to_webp(aligned, PROFILE_MAX_SIZE_KB)
     except Exception as e:
         print(f"[profile_align] fallback to center crop: {type(e).__name__}: {e}")
@@ -1067,36 +1067,65 @@ def _profile_png_bytes(image_bytes: bytes) -> bytes:
 
 def uniform_profile_background_gemini(aligned_image_bytes: bytes) -> bytes:
     """
-    Gemini edit pass: remove visible inner frame / flat padding from affine alignment.
-    Keeps the person and face position; only unifies background edge-to-edge.
+    Gemini edit pass: remove inner frame / side bars / flat padding from affine alignment.
+    Uses a full-bleed reference banner (engage4more style — no borders) as the target look.
     """
     client = get_gemini_client()
     src = Image.open(io.BytesIO(aligned_image_bytes)).convert("RGB")
     if src.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
         src = src.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
 
-    prompt = f"""You are retouching a professional profile banner ({PROFILE_WIDTH}×{PROFILE_HEIGHT} pixels).
+    contents: list = [
+        src,
+        (
+            "IMAGE 1 (above): Profile banner TO FIX. It has WRONG borders — an inner "
+            "rectangle (smaller photo) inside the frame, with dark gray/black vertical "
+            "bars on the left and right and/or flat padding around the subject. "
+            "Picture-in-picture effect. This must be converted to full-bleed."
+        ),
+    ]
 
-PROBLEM: The input has a visible "double background" or inner rectangle — the subject sits inside a smaller photo, and flat or mismatched padding from automated face alignment surrounds it (picture-in-picture / two borders).
+    # Reference: correct engage4more banner — gradient fills entire canvas, zero borders.
+    ref_path = VIGNETTE_REFERENCE_PATH
+    if os.path.isfile(ref_path):
+        ref_img = Image.open(ref_path).convert("RGB")
+        contents.append(ref_img)
+        contents.append(
+            "IMAGE 2 (above): TARGET STYLE — a correct engage4more profile banner. "
+            "Notice: the background gradient and vignette extend to ALL FOUR EDGES of "
+            "the frame. There is NO inner box, NO black side bars, NO second background, "
+            "NO letterboxing. The person sits on one continuous canvas (like Aman Gupta / "
+            "standard speaker banners on the site)."
+        )
 
-YOUR ONLY TASK: Fix the BACKGROUND so the full canvas is one seamless image.
+    prompt = f"""Convert IMAGE 1 into the same FULL-BLEED layout quality as IMAGE 2 (target style).
 
-STRICT — DO NOT CHANGE:
-- The person: same face, identity, pose, expression, clothing, hair, lighting on skin.
-- Face position in the frame: hairline near Y={GUIDE_TOP_Y}, chin near Y={GUIDE_BOTTOM_Y}, face centered near X={GUIDE_CENTER_X}. Do NOT move, zoom, or recrop the subject.
+WHAT IS WRONG IN IMAGE 1 (you must eliminate ALL of these):
+- Dark gray or black vertical bars on the left and right edges.
+- A visible inner rectangle — the portrait looks pasted inside a larger frame.
+- Flat, solid-colour padding bands that do not match the inner gradient.
+- Any "two backgrounds" or picture-in-picture seam.
 
-YOU MUST:
-- Extend and blend the existing gradient/vignette into all empty or flat border areas.
-- Top: vivid colour behind the head; bottom: smooth fade to black into lower clothing; corners: soft radial vignette — all continuous with the inner area.
-- Zero visible rectangular frame, seam, or second background colour band anywhere on the canvas.
-- Output exactly {PROFILE_WIDTH}×{PROFILE_HEIGHT}, landscape 3:2, edge-to-edge unified background.
+WHAT IMAGE 2 SHOWS (your output must match this structure):
+- One seamless background from edge to edge on a {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas.
+- Top: clean colour behind the head; bottom: smooth fade to black into clothing; corners: soft vignette.
+- Background touches the left, right, top, and bottom edges — no empty bars anywhere.
 
-Do not add text, logos, watermarks, or extra objects."""
+STRICT — DO NOT CHANGE THE PERSON IN IMAGE 1:
+- Same face, identity, pose, expression, clothing, hair, skin lighting.
+- Face position is FIXED: hairline MUST stay at Y={GUIDE_TOP_Y}, chin at Y={GUIDE_BOTTOM_Y}, face center at X={GUIDE_CENTER_X} (designer grid). Do NOT move the face up/down/left/right.
+- Do NOT zoom or recrop the subject. Do NOT replace the subject with anyone from IMAGE 2.
+
+YOUR ONLY TASK: Repaint/extend the BACKGROUND of IMAGE 1 so it looks like IMAGE 2's full-bleed treatment — subject unchanged, borders gone.
+
+Output exactly one {PROFILE_WIDTH}×{PROFILE_HEIGHT} landscape image. No text or logos."""
+
+    contents.append(prompt)
 
     out_bytes = call_gemini_with_retry(
         client,
         model=GEMINI_MODEL,
-        contents=[src, prompt],
+        contents=contents,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
             image_config=types.ImageConfig(aspect_ratio="3:2"),
@@ -1755,9 +1784,9 @@ if _align_ok:
         from profile_align import _use_mediapipe_detection
 
         _mp_note = (
-            "MediaPipe + OpenCV"
+            "MediaPipe + YuNet"
             if _use_mediapipe_detection()
-            else "OpenCV only (Render — PROFILE_ALIGN_USE_MEDIAPIPE=0)"
+            else "YuNet + Haar (Render — PROFILE_ALIGN_USE_MEDIAPIPE=0)"
         )
     except Exception:
         _mp_note = "OpenCV"
@@ -2193,7 +2222,18 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     if align_err and "center-crop fallback" in align_err:
                         st.write(f"  ⚠ Partial align: {align_err}")
                     else:
-                        st.write("  ✅ Face aligned to guides (765×480, background preserved)")
+                        try:
+                            from profile_align import format_guide_errors, is_face_on_guides
+
+                            _al = Image.open(io.BytesIO(aligned_bytes))
+                            if is_face_on_guides(_al):
+                                st.write("  ✅ Face on guides (765×480)")
+                            else:
+                                st.write(
+                                    f"  ⚠ Face still off guides: {format_guide_errors(_al)}"
+                                )
+                        except Exception:
+                            st.write("  ✅ Face aligned (765×480)")
                     profile_candidates.append(aligned_bytes)
                     preview_bytes = aligned_bytes
                 else:
@@ -2231,9 +2271,26 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     f"  Candidate {j}/{len(profile_candidates)} — seamless background..."
                 ):
                     try:
-                        fixed = uniform_profile_background_gemini(cand_bytes)
+                        fixed = _profile_png_bytes(
+                            uniform_profile_background_gemini(cand_bytes)
+                        )
                         uniformed_candidates.append(fixed)
-                        st.write(f"  ✅ Candidate {j} background unified")
+                        try:
+                            from profile_align import format_guide_errors, is_face_on_guides
+
+                            _u = Image.open(io.BytesIO(fixed))
+                            if is_face_on_guides(_u):
+                                st.write(
+                                    f"  ✅ Candidate {j} background unified (face on guides)"
+                                )
+                            else:
+                                st.write(
+                                    f"  ✅ Candidate {j} background unified "
+                                    f"(face may be slightly off guides — no re-align to avoid borders: "
+                                    f"{format_guide_errors(_u)})"
+                                )
+                        except Exception:
+                            st.write(f"  ✅ Candidate {j} background unified")
                     except Exception as e:
                         st.warning(
                             f"  ⚠ Candidate {j} background uniform failed ({e}) "
@@ -2285,7 +2342,7 @@ if (
     )
     st.caption(
         f"Generated {len(st.session_state.profile_candidates)} candidate profile images "
-        "(face aligned to guides, then Gemini background uniform on 765×480). "
+        "(align once → Gemini background uniform only; no re-align after uniform). "
         "Choose the one you like best — it becomes profile.webp and the gallery face anchor."
         + guide_caption
     )
