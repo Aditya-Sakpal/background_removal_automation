@@ -1005,17 +1005,26 @@ Background — vertical gradient + radial vignette (match the canonical referenc
 
 Composition (landscape 3:2, exactly {PROFILE_WIDTH}×{PROFILE_HEIGHT} pixels):
 
-MANDATORY FACE POSITION — designer grid (non-negotiable; post-processing depends on this):
-- Output image size: exactly {PROFILE_WIDTH} pixels wide × {PROFILE_HEIGHT} pixels tall.
-- Measure from the TOP-LEFT corner (0,0). Y increases downward.
-- Top of hair / hairline must sit at Y = {GUIDE_TOP_Y} (not higher, not lower — not Y=70 or Y=80).
-- Bottom of chin must sit at Y = {GUIDE_BOTTOM_Y} (not Y=295 or Y=310).
-- The face vertical span from hairline to chin must be {FACE_BAND_HEIGHT} pixels ({GUIDE_BOTTOM_Y} minus {GUIDE_TOP_Y}).
-- Horizontal centre of the face (midpoint between temples / centre of nose) must be at X = {GUIDE_CENTER_X} (horizontal centre of frame).
-- Leave empty background above the hairline down to the top edge (pixels Y=0 to Y={GUIDE_TOP_Y}).
-- Shoulders and upper torso extend below the chin; black gradient may cover lower clothing.
-- If the face is too large, ZOOM OUT until hairline and chin hit these Y coordinates. If too small, ZOOM IN until they match.
-- Do NOT place the face by "eye line at mid-frame" rules — use the Y={GUIDE_TOP_Y} and Y={GUIDE_BOTTOM_Y} coordinates above.
+🟥 MANDATORY FACE POSITION — designer grid (HARD REQUIREMENT — most important rule in this whole prompt) 🟥
+The entire face — from the top of the hair (hairline) down to the bottom of the chin — must fit EXACTLY between two horizontal lines on the canvas:
+
+    UPPER LINE  →  Y = {GUIDE_TOP_Y}  (top of hair / hairline touches this line)
+    LOWER LINE  →  Y = {GUIDE_BOTTOM_Y}  (bottom of chin touches this line)
+
+Coordinate system: top-left of the {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas is (0,0). Y increases downward.
+
+Rules — NO exceptions:
+- The top of the hair MUST sit on Y = {GUIDE_TOP_Y}. Not Y=40, not Y=60, not Y=90. EXACTLY Y={GUIDE_TOP_Y} (±2 pixels).
+- The bottom of the chin MUST sit on Y = {GUIDE_BOTTOM_Y}. Not Y=280, not Y=320. EXACTLY Y={GUIDE_BOTTOM_Y} (±2 pixels).
+- The vertical face height (hairline → chin) is therefore EXACTLY {FACE_BAND_HEIGHT} pixels. Nothing else.
+- The horizontal centre of the face (centre of the nose, midpoint between the eyes) MUST sit on X = {GUIDE_CENTER_X} (the vertical middle of the canvas).
+- Background ONLY between Y=0 and Y={GUIDE_TOP_Y} (above the hairline). No part of the head, hair, or face enters that band.
+- Shoulders, neck, upper torso live BELOW Y={GUIDE_BOTTOM_Y}.
+- If the face would be larger than {FACE_BAND_HEIGHT} px, ZOOM OUT (move the camera back) until the hairline → chin span is exactly {FACE_BAND_HEIGHT} px.
+- If the face would be smaller than {FACE_BAND_HEIGHT} px, ZOOM IN until the span is exactly {FACE_BAND_HEIGHT} px.
+- Do NOT use eye-line / rule-of-thirds heuristics. Use these Y coordinates directly.
+
+Mental check: imagine drawing a horizontal cyan line at Y={GUIDE_TOP_Y} and a horizontal cyan line at Y={GUIDE_BOTTOM_Y}. The whole face must fit snugly between those two lines — top of hair touches the upper line, chin touches the lower line.
 
 Additional framing:
 - The full subject from top-of-hair to upper-torso fits inside the frame without cropping the top of the head or shoulders.
@@ -1067,65 +1076,49 @@ def _profile_png_bytes(image_bytes: bytes) -> bytes:
 
 def uniform_profile_background_gemini(aligned_image_bytes: bytes) -> bytes:
     """
-    Gemini edit pass: remove inner frame / side bars / flat padding from affine alignment.
-    Uses a full-bleed reference banner (engage4more style — no borders) as the target look.
+    Gemini edit pass: ONLY remove flat border padding and extend the existing background
+    so the canvas is seamless edge-to-edge. The PERSON must not be changed in any way.
+
+    NOTE: No reference images are passed in — using only a text description of the target
+    background avoids identity bleed (e.g. Zakir Khan) from a composition reference image.
     """
     client = get_gemini_client()
     src = Image.open(io.BytesIO(aligned_image_bytes)).convert("RGB")
     if src.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
         src = src.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
 
-    contents: list = [
-        src,
-        (
-            "IMAGE 1 (above): Profile banner TO FIX. It has WRONG borders — an inner "
-            "rectangle (smaller photo) inside the frame, with dark gray/black vertical "
-            "bars on the left and right and/or flat padding around the subject. "
-            "Picture-in-picture effect. This must be converted to full-bleed."
-        ),
-    ]
+    prompt = f"""You are doing a BACKGROUND-ONLY retouch on the input image (a {PROFILE_WIDTH}×{PROFILE_HEIGHT} profile banner).
 
-    # Reference: correct engage4more banner — gradient fills entire canvas, zero borders.
-    ref_path = VIGNETTE_REFERENCE_PATH
-    if os.path.isfile(ref_path):
-        ref_img = Image.open(ref_path).convert("RGB")
-        contents.append(ref_img)
-        contents.append(
-            "IMAGE 2 (above): TARGET STYLE — a correct engage4more profile banner. "
-            "Notice: the background gradient and vignette extend to ALL FOUR EDGES of "
-            "the frame. There is NO inner box, NO black side bars, NO second background, "
-            "NO letterboxing. The person sits on one continuous canvas (like Aman Gupta / "
-            "standard speaker banners on the site)."
-        )
+THE PROBLEM TO FIX:
+The input has flat-colour borders or a visible inner rectangle (picture-in-picture / letterbox bars / mismatched padding around the subject).
+Eliminate ALL of these:
+- Dark grey, black, or solid-colour vertical bars on the left and right edges.
+- A visible inner rectangular frame — the portrait should not look pasted inside a larger box.
+- Flat padding bands that don't match the inner gradient.
+- Any "two backgrounds" or seam between the portrait area and the border area.
 
-    prompt = f"""Convert IMAGE 1 into the same FULL-BLEED layout quality as IMAGE 2 (target style).
+YOUR ONLY TASK — extend / repaint the BACKGROUND so it fills the whole canvas with the same style of background that already exists around the subject's head and shoulders inside the photo. Keep the same colour palette, lighting direction, and vignette that the input already has — just extend it to all four edges so there are no borders.
 
-WHAT IS WRONG IN IMAGE 1 (you must eliminate ALL of these):
-- Dark gray or black vertical bars on the left and right edges.
-- A visible inner rectangle — the portrait looks pasted inside a larger frame.
-- Flat, solid-colour padding bands that do not match the inner gradient.
-- Any "two backgrounds" or picture-in-picture seam.
+REQUIRED BACKGROUND CHARACTERISTICS (these match the rest of the engage4more banner family — apply only to the background, not to the person):
+- TOP portion of the background: a clean, vivid colour that complements the subject's clothing (e.g. deep royal blue / teal / polished grey-blue / similar to what the input already uses).
+- BOTTOM portion of the background: smooth fade DOWNWARD into a rich, deep BLACK band. The lower part of the subject's clothing dissolves into that black with no hard edge.
+- A SOFT RADIAL VIGNETTE on top of the vertical gradient: the area immediately behind the head is the brightest part of the background; the corners and edges of the frame are noticeably darker, in a smooth radial fade. No hard mask, no heavy black border, the subject is never silhouetted.
+- All transitions smooth (no banding, no hard lines).
+- Background touches LEFT, RIGHT, TOP, and BOTTOM edges of the {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas — full bleed.
 
-WHAT IMAGE 2 SHOWS (your output must match this structure):
-- One seamless background from edge to edge on a {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas.
-- Top: clean colour behind the head; bottom: smooth fade to black into clothing; corners: soft vignette.
-- Background touches the left, right, top, and bottom edges — no empty bars anywhere.
+🟥 ABSOLUTELY DO NOT 🟥 (any of these = failure):
+- Do NOT change the person at all. Same face, same skin tone, same hair, same beard/moustache/stubble, same ethnicity, same age, same gender, same expression, same pose, same clothing colour, same clothing style — identical to the input.
+- Do NOT swap or regenerate the face. Do NOT borrow features from anyone else (no celebrity, no Zakir Khan, no Aman Gupta, no person from your training data).
+- Do NOT move the face up, down, left, or right. The hairline must stay at Y≈{GUIDE_TOP_Y}, the chin at Y≈{GUIDE_BOTTOM_Y}, the face center at X≈{GUIDE_CENTER_X}.
+- Do NOT zoom in or zoom out on the subject. Do NOT recrop. Do NOT change the size of the head/face.
+- Do NOT add text, logos, watermarks, microphones, hands, props, or extra objects.
 
-STRICT — DO NOT CHANGE THE PERSON IN IMAGE 1:
-- Same face, identity, pose, expression, clothing, hair, skin lighting.
-- Face position is FIXED: hairline MUST stay at Y={GUIDE_TOP_Y}, chin at Y={GUIDE_BOTTOM_Y}, face center at X={GUIDE_CENTER_X} (designer grid). Do NOT move the face up/down/left/right.
-- Do NOT zoom or recrop the subject. Do NOT replace the subject with anyone from IMAGE 2.
-
-YOUR ONLY TASK: Repaint/extend the BACKGROUND of IMAGE 1 so it looks like IMAGE 2's full-bleed treatment — subject unchanged, borders gone.
-
-Output exactly one {PROFILE_WIDTH}×{PROFILE_HEIGHT} landscape image. No text or logos."""
-
-    contents.append(prompt)
+Output: exactly one {PROFILE_WIDTH}×{PROFILE_HEIGHT} landscape image — same person in the same position, with one continuous background that has no borders."""
 
     out_bytes = call_gemini_with_retry(
         client,
         model=GEMINI_MODEL,
-        contents=contents,
+        contents=[src, prompt],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
             image_config=types.ImageConfig(aspect_ratio="3:2"),
@@ -2158,17 +2151,33 @@ if st.button("Generate Image", type="primary", width="stretch"):
         "face centred at X=382.5 on a 765×480 canvas."
     )
 
+    # Per-candidate stage tracking — show RAW Gemini, after Python ALIGN, after Gemini UNIFORM.
     profile_candidates: list[bytes] = []
+    stage_records: list[dict] = []  # one dict per candidate with raw/aligned/uniformed bytes + notes
+
+    def _guide_caption_for(image_bytes: bytes, label: str) -> str:
+        try:
+            from profile_align import format_guide_errors, is_face_on_guides
+
+            _img = Image.open(io.BytesIO(image_bytes))
+            if _img.size == (PROFILE_WIDTH, PROFILE_HEIGHT):
+                marker = "✅ on guides" if is_face_on_guides(_img) else "⚠ off guides"
+                return f"{label} — {marker} ({format_guide_errors(_img)})"
+            return f"{label} — {_img.size[0]}×{_img.size[1]} (not yet 765×480)"
+        except Exception:
+            return label
+
     with st.status(
         f"Step 2 — Generating {NUM_PROFILE_CANDIDATES} profile candidates "
         f"(Gemini → align → background uniform; Zakir check + up to {ZAKIR_MAX_RETRIES} retries each)...",
         expanded=True,
     ) as status:
         for i in range(1, NUM_PROFILE_CANDIDATES + 1):
-            st.markdown(f"**Candidate {i}/{NUM_PROFILE_CANDIDATES}**")
+            st.markdown(f"### Candidate {i}/{NUM_PROFILE_CANDIDATES}")
             candidate_img: bytes | None = None
             feedback_for_next = None
 
+            # ── Stage 1: Gemini generation (+ Zakir check / retries) ────────────────
             for attempt in range(1, ZAKIR_MAX_RETRIES + 2):  # 1 initial + up to N retries
                 st.write(
                     f"  Attempt {attempt}/{ZAKIR_MAX_RETRIES + 1} — generating..."
@@ -2182,8 +2191,6 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     candidate_img = None
                     break
 
-                # Gemini-based Zakir identity check on the freshly generated image
-                # (no reference image — Gemini decides from prior knowledge).
                 try:
                     check = gemini_zakir_check(candidate_img)
                 except Exception as e:
@@ -2200,7 +2207,6 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     )
                     break
 
-                # Is Zakir — log and retry if budget remains.
                 st.write(
                     f"  ❌ Looks like Zakir Khan "
                     + (f"({explanation})" if explanation else "")
@@ -2213,46 +2219,63 @@ if st.button("Generate Image", type="primary", width="stretch"):
                     break
                 feedback_for_next = ZAKIR_REGEN_FEEDBACK
 
-            if candidate_img is not None:
-                with st.spinner(f"  Aligning candidate {i} (face guides, keep Gemini background)..."):
-                    aligned_bytes, aligned_ok, align_err = apply_profile_alignment(
-                        candidate_img
-                    )
-                if aligned_ok:
-                    if align_err and "center-crop fallback" in align_err:
-                        st.write(f"  ⚠ Partial align: {align_err}")
-                    else:
-                        try:
-                            from profile_align import format_guide_errors, is_face_on_guides
+            if candidate_img is None:
+                st.warning(f"Candidate {i} produced no image — skipping.")
+                continue
 
-                            _al = Image.open(io.BytesIO(aligned_bytes))
-                            if is_face_on_guides(_al):
-                                st.write("  ✅ Face on guides (765×480)")
-                            else:
-                                st.write(
-                                    f"  ⚠ Face still off guides: {format_guide_errors(_al)}"
-                                )
-                        except Exception:
-                            st.write("  ✅ Face aligned (765×480)")
-                    profile_candidates.append(aligned_bytes)
-                    preview_bytes = aligned_bytes
-                else:
-                    st.warning(
-                        "  ⚠ Alignment failed — showing raw Gemini output for this candidate. "
-                        f"**Reason:** {align_err or 'unknown'}"
-                    )
-                    profile_candidates.append(candidate_img)
-                    preview_bytes = candidate_img
-                st.image(
-                    profile_image_for_display(preview_bytes),
-                    caption=(
-                        f"Candidate {i} preview — cyan: Y={GUIDE_TOP_Y}, Y={GUIDE_BOTTOM_Y}, "
-                        f"center X={GUIDE_CENTER_X:.0f}"
-                    ),
-                    width="stretch",
+            # Normalize raw Gemini output to 765×480 for preview consistency only.
+            raw_bytes = _profile_png_bytes(candidate_img)
+
+            # ── Stage 2: Python alignment ──────────────────────────────────────────
+            with st.spinner(f"  Aligning candidate {i} (face → Y={GUIDE_TOP_Y}/{GUIDE_BOTTOM_Y})..."):
+                aligned_bytes, aligned_ok, align_err = apply_profile_alignment(candidate_img)
+            aligned_bytes = _profile_png_bytes(aligned_bytes)
+            if not aligned_ok:
+                st.warning(
+                    f"  ⚠ Alignment failed for candidate {i} ({align_err}). "
+                    "Using raw Gemini output for the next stage."
                 )
-            else:
-                st.warning(f"Candidate {i} produced no image.")
+                aligned_bytes = raw_bytes
+            elif align_err and "center-crop fallback" in align_err:
+                st.write(f"  ⚠ Partial align: {align_err}")
+
+            # ── Stage 3: Gemini background uniform (no face change, no reference image) ─
+            uniformed_bytes = aligned_bytes
+            uniform_note: str | None = None
+            if PROFILE_UNIFORM_BACKGROUND:
+                with st.spinner(f"  Removing borders / uniforming background for candidate {i}..."):
+                    try:
+                        uniformed_bytes = _profile_png_bytes(
+                            uniform_profile_background_gemini(aligned_bytes)
+                        )
+                    except Exception as e:
+                        uniform_note = f"failed ({e}) — keeping aligned version"
+                        uniformed_bytes = aligned_bytes
+
+            stage_records.append(
+                {
+                    "raw": raw_bytes,
+                    "aligned": aligned_bytes,
+                    "uniformed": uniformed_bytes,
+                    "uniform_note": uniform_note,
+                }
+            )
+            # Final chosen version for the picker is the uniformed image.
+            profile_candidates.append(uniformed_bytes)
+
+            # 3-column preview: see exactly what each stage produced.
+            cap1 = _guide_caption_for(raw_bytes, "1. Raw Gemini")
+            cap2 = _guide_caption_for(aligned_bytes, "2. After Python align")
+            cap3 = _guide_caption_for(uniformed_bytes, "3. After background uniform")
+            if uniform_note:
+                cap3 = f"3. Background uniform {uniform_note}"
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.image(profile_image_for_display(raw_bytes), caption=cap1, width="stretch")
+            with c2:
+                st.image(profile_image_for_display(aligned_bytes), caption=cap2, width="stretch")
+            with c3:
+                st.image(profile_image_for_display(uniformed_bytes), caption=cap3, width="stretch")
 
         if not profile_candidates:
             status.update(
@@ -2261,51 +2284,6 @@ if st.button("Generate Image", type="primary", width="stretch"):
             )
             st.error("All profile candidate generations failed. Try again.")
             st.stop()
-
-        # Step 2b: Gemini pass on all candidates — seamless background (no double frame).
-        if PROFILE_UNIFORM_BACKGROUND:
-            st.markdown("**Background uniforming (Gemini)**")
-            uniformed_candidates: list[bytes] = []
-            for j, cand_bytes in enumerate(profile_candidates, 1):
-                with st.spinner(
-                    f"  Candidate {j}/{len(profile_candidates)} — seamless background..."
-                ):
-                    try:
-                        fixed = _profile_png_bytes(
-                            uniform_profile_background_gemini(cand_bytes)
-                        )
-                        uniformed_candidates.append(fixed)
-                        try:
-                            from profile_align import format_guide_errors, is_face_on_guides
-
-                            _u = Image.open(io.BytesIO(fixed))
-                            if is_face_on_guides(_u):
-                                st.write(
-                                    f"  ✅ Candidate {j} background unified (face on guides)"
-                                )
-                            else:
-                                st.write(
-                                    f"  ✅ Candidate {j} background unified "
-                                    f"(face may be slightly off guides — no re-align to avoid borders: "
-                                    f"{format_guide_errors(_u)})"
-                                )
-                        except Exception:
-                            st.write(f"  ✅ Candidate {j} background unified")
-                    except Exception as e:
-                        st.warning(
-                            f"  ⚠ Candidate {j} background uniform failed ({e}) "
-                            "— using aligned version"
-                        )
-                        uniformed_candidates.append(_profile_png_bytes(cand_bytes))
-                st.image(
-                    profile_image_for_display(uniformed_candidates[-1]),
-                    caption=(
-                        f"Candidate {j} after background uniform — "
-                        f"Y={GUIDE_TOP_Y}, Y={GUIDE_BOTTOM_Y}, X={GUIDE_CENTER_X:.0f}"
-                    ),
-                    width="stretch",
-                )
-            profile_candidates = uniformed_candidates
 
         status.update(
             label=f"Step 2 — Generated {len(profile_candidates)}/{NUM_PROFILE_CANDIDATES} candidates",
