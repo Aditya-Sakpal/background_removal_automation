@@ -28,8 +28,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-GEMINI_MODEL = "gemini-2.5-flash-image"  # Nano Banana — image generation
-GEMINI_TEXT_MODEL = "gemini-2.5-flash"  # vision-capable text model for JSON checks
+GPT_IMAGE_MODEL = "gpt-image-2"           # OpenAI image generation / editing
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"  # vision-capable text model for JSON checks (Zakir check)
 MIN_IMAGES = 2
 MAX_IMAGES = 3
 MAX_RETRY = 3
@@ -66,7 +66,7 @@ GALLERY_MAX_SIZE_KB = 50
 # Google image pool → OpenAI picks best gallery-style references
 REFERENCE_TOP_K_OPENAI = 10
 EXTRA_GALLERY_BATCH_SIZE = 10  # batch added when user clicks "Fetch 10 more"
-NANO_BANANA_REGEN_MODEL = "gemini-2.5-flash-image"
+# NANO_BANANA_REGEN_MODEL removed — all image generation now uses GPT_IMAGE_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +284,60 @@ def call_gemini_with_retry(
             raise
     raise RuntimeError(
         f"Gemini failed {max_attempts} times for {context} (transient). Last error: {last_err}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI gpt-image-2 image generation helper
+# ---------------------------------------------------------------------------
+def _pil_to_png_bytes(img: Image.Image) -> bytes:
+    """Convert a PIL image to PNG bytes (required by the images.edit endpoint)."""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def call_openai_image_with_retry(
+    image_bytes_list: list[bytes],
+    prompt: str,
+    *,
+    size: str = "1536x1024",
+    quality: str = "high",
+    context: str = "image",
+    max_attempts: int = 3,
+) -> bytes:
+    """
+    Call OpenAI images.edit with gpt-image-2 and return the output as raw bytes.
+    image_bytes_list: one or more PNG/JPG/WEBP images (first = primary input).
+    Retries on any exception up to max_attempts times.
+    """
+    import time
+
+    client = get_openai_client()
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Build file-like objects; the SDK requires a .name attribute.
+            files = []
+            for b in image_bytes_list:
+                f = io.BytesIO(b)
+                f.name = "image.png"
+                files.append(f)
+            response = client.images.edit(
+                model=GPT_IMAGE_MODEL,
+                image=files if len(files) > 1 else files[0],
+                prompt=prompt,
+                size=size,
+                quality=quality,
+            )
+            return base64.b64decode(response.data[0].b64_json)
+        except Exception as e:
+            last_err = e
+            print(f"[gpt-image-2] attempt {attempt} failed for {context}: {type(e).__name__}: {e}")
+            if attempt < max_attempts:
+                time.sleep(0.5 * attempt)
+    raise RuntimeError(
+        f"gpt-image-2 failed {max_attempts} times for {context}. Last error: {last_err}"
     )
 
 
@@ -786,7 +840,7 @@ def prepare_gallery_webp(image_bytes: bytes) -> tuple[bytes, bool]:
 def regenerate_gallery_image_nano_banana(
     source_image_bytes: bytes,
     *,
-    model: str = NANO_BANANA_REGEN_MODEL,  # kept for signature compat, unused
+    model: str = GPT_IMAGE_MODEL,  # kept for signature compat
 ) -> bytes:
     """
     Produce a gallery banner directly from the source SerpApi image — no Gemini edit.
@@ -859,154 +913,78 @@ def generate_linkedin_image(
     improvement_feedback: str | None = None,
     custom_prompt: str | None = None,
 ) -> bytes:
-    client = get_gemini_client()
-
-    contents: list = []
-
-    # 1. SUBJECT PHOTOS FIRST — these are the identity anchor. Putting them first
-    #    in the contents list gives them more weight in Gemini's multi-image
-    #    attention, which reduces the chance of the composition reference's
-    #    person bleeding into the output.
-    subject_count = len(images)
+    # Build input image list: subject photos first, then composition reference.
+    input_images: list[bytes] = []
     for img_bytes, _ in images:
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        contents.append(pil_img)
-    contents.append(
-        f"The first {subject_count} image(s) above are the SUBJECT photos. They define "
-        "the IDENTITY of the person who must appear in the output:\n"
-        "  • Same face — same facial structure, same skin tone, same nose, same lips, "
-        "    same eyes, same eyebrows, same jawline.\n"
-        "  • Same hair — same hair style, same hair colour, same hairline.\n"
-        "  • Same facial hair (beard, moustache, stubble) — same shape, length, density.\n"
-        "  • Same age, gender, and ethnicity.\n"
-        "  • Same clothing — same colour, same style, same neckline, same fabric.\n"
-        "The person rendered in the output MUST be this person. Not a different "
-        "person who looks similar. Not a blend of this person with anyone else. "
-        "The exact same individual shown in these subject photos."
-    )
+        input_images.append(_pil_to_png_bytes(Image.open(io.BytesIO(img_bytes))))
 
-    # 2. CANONICAL COMPOSITION reference (Zakir Khan) — appears AFTER the subject
-    #    photos so it doesn't dominate the identity signal. Used ONLY for the
-    #    four composition rules; the person, clothing, and colour palette in
-    #    this reference must be ignored.
-    composition_ref = Image.open(VIGNETTE_REFERENCE_PATH).convert("RGB")
-    contents.append(composition_ref)
-    contents.append(
-        "The LAST image above is the CANONICAL COMPOSITION REFERENCE. It is a photo "
-        "of the Indian stand-up comedian ZAKIR KHAN. Zakir Khan is NOT the subject "
-        "of this generation — he is shown ONLY as inspiration for the COMPOSITION "
-        "PATTERN (framing, headroom, gradient, vignette). Read this carefully:\n"
-        "\n"
-        "  ⚠ ZAKIR KHAN IS NOT THE SUBJECT. ⚠\n"
-        "  ⚠ DO NOT GENERATE ZAKIR KHAN IN THE OUTPUT. ⚠\n"
-        "  ⚠ THE SUBJECT IS THE PERSON IN THE SUBJECT PHOTOS ABOVE — NOT ZAKIR KHAN. ⚠\n"
-        "\n"
-        "Treat Zakir Khan's body, face, hair, beard, ethnicity, expression, pose, "
-        "blazer, and clothing as if they were invisible. You are looking at this "
-        "image purely for the LAYOUT (where the head sits in the frame, how the "
-        "background fades into the clothing, how the corners are darker, where the "
-        "subject is positioned horizontally). The IDENTITY of the person in the "
-        "output comes ONLY from the SUBJECT PHOTOS above — never from Zakir Khan.\n"
-        "\n"
-        "Specifically, the FOUR composition features you must replicate from this "
-        "reference are:\n"
-        "  (a) SUBJECT SIZE / HEADROOM — notice how small Zakir Khan is relative to "
-        "the frame: a generous band of empty background sits above the top of his "
-        "hair, occupying roughly the upper 20-25% of the frame. The subject in your "
-        "output should be framed from a similar wider distance — head and shoulders "
-        "take only the lower portion of the image, never filling it from edge to edge.\n"
-        "  (b) BLACK BOTTOM GRADIENT — the background fades smoothly into a deep "
-        "dark band along the bottom edge, and that dark band extends UPWARD into "
-        "the lower portion of Zakir Khan's clothing so the bottom of the blazer "
-        "dissolves into darkness with no sharp visible edge. Replicate this same "
-        "blend on your subject's clothing.\n"
-        "  (c) HORIZONTAL CENTRING — Zakir Khan sits roughly centred in the frame "
-        "with similar amounts of background on the left and the right. Centre your "
-        "subject the same way.\n"
-        "  (d) SOFT RADIAL VIGNETTE — the area immediately behind/around Zakir "
-        "Khan's head is the brightest part of the background; the corners and "
-        "edges are noticeably darker in a smooth radial fade (no hard mask, no "
-        "heavy border). Replicate the same vignette behind your subject's head.\n"
-        "\n"
-        "FORBIDDEN — none of these from Zakir Khan should appear in your output:\n"
-        "  • Zakir Khan's face, beard, eyes, nose, lips, or jawline.\n"
-        "  • Zakir Khan's hair style or hair colour.\n"
-        "  • Zakir Khan's ethnicity, age, gender expression, or body type.\n"
-        "  • Zakir Khan's pose, hand gestures, or microphone.\n"
-        "  • Zakir Khan's blazer, shirt, or any of his clothing.\n"
-        "  • The maroon/red/dark background hue (use a colour that complements YOUR "
-        "subject's clothing instead).\n"
-        "If the output looks like Zakir Khan in any way, you have made a mistake."
-    )
+    subject_count = len(input_images)
 
-    # 3. BLACK BOTTOM GRADIENT reference — additional anchor for rule (b) only.
-    #    May not always exist on every deployment; skip silently if missing.
+    # Composition reference (Zakir Khan) — layout/gradient/vignette ONLY.
     try:
-        black_gradient_ref = Image.open(BLACK_GRADIENT_REFERENCE_PATH).convert("RGB")
-        contents.append(black_gradient_ref)
-        contents.append(
-            "The image above is the BLACK BOTTOM GRADIENT REFERENCE. It exists ONLY "
-            "to show the exact vertical fade pattern at the bottom of the frame — a "
-            "smooth transition from the upper background colour down into a deep "
-            "black band along the bottom edge, where the lower portion of the "
-            "subject's clothing dissolves into the black with no hard visible edge. "
-            "Use this image ONLY for the bottom-gradient pattern (rule (b)). "
-            "DO NOT copy any person, clothing, face, or unrelated visual element "
-            "from this image — and DO NOT copy its overall colour palette beyond "
-            "the bottom-fade-to-black effect."
-        )
+        comp_ref_bytes = _pil_to_png_bytes(Image.open(VIGNETTE_REFERENCE_PATH))
+        input_images.append(comp_ref_bytes)
+        has_comp_ref = True
     except FileNotFoundError:
-        pass
+        has_comp_ref = False
 
-    # 4. Generation prompt — composition rules + explicit identity anchor.
-    prompt_text = f"""🚨 PRIMARY INSTRUCTION (READ FIRST, OVERRIDES EVERYTHING ELSE) 🚨
+    # Black bottom gradient reference — rule (b) anchor only.
+    try:
+        grad_ref_bytes = _pil_to_png_bytes(Image.open(BLACK_GRADIENT_REFERENCE_PATH))
+        input_images.append(grad_ref_bytes)
+        has_grad_ref = True
+    except FileNotFoundError:
+        has_grad_ref = False
 
-The last image in this input is a photo of ZAKIR KHAN (an Indian stand-up comedian). His image is provided STRICTLY AS A REFERENCE for the COMPOSITION ONLY. He is there for inspiration on how the layout / framing / background should look — that is the ONLY thing you should take from his image.
+    comp_ref_note = ""
+    if has_comp_ref:
+        comp_ref_note = f"""
+IMAGE REFERENCES IN THIS REQUEST:
+- Images 1–{subject_count}: SUBJECT PHOTOS — the person whose identity must appear in the output.
+- Image {subject_count + 1}: COMPOSITION REFERENCE (Zakir Khan). Use ONLY for layout/framing/gradient/vignette. DO NOT copy Zakir Khan's face, identity, or appearance in any way.
+{"- Image " + str(subject_count + 2) + ": BLACK BOTTOM GRADIENT REFERENCE — shows the bottom fade-to-black pattern only. Ignore the person in this image." if has_grad_ref else ""}
+
+"""
+
+    prompt_text = f"""{comp_ref_note}🚨 PRIMARY INSTRUCTION (READ FIRST, OVERRIDES EVERYTHING ELSE) 🚨
+
+{"One of the input images is a photo of ZAKIR KHAN (an Indian stand-up comedian). His image is provided STRICTLY AS A REFERENCE for the COMPOSITION ONLY — layout, framing, background gradient, and vignette. That is the ONLY thing you should take from his image." if has_comp_ref else ""}
 
 ➤ DO NOT ADD ZAKIR KHAN IN THE IMAGE YOU'LL BE GENERATING.
 ➤ DO NOT make the subject look like Zakir Khan in any way.
-➤ DO NOT borrow Zakir Khan's face, beard, hair, ethnicity, expression, pose, hand gestures, microphone, or clothing.
-➤ The person in your output must be the person from the SUBJECT PHOTOS (the first images in the input) — a DIFFERENT individual from Zakir Khan.
-
-If your output contains anyone who resembles Zakir Khan, the generation is wrong and must be redone.
+➤ The person in your output must be the person from the SUBJECT PHOTOS (Images 1–{subject_count}) — a DIFFERENT individual from Zakir Khan.
 
 ────────────────────────────────────────────────────────────
 
-Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos. The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners — matching the composition layout from the Zakir Khan reference (last image), but with YOUR subject (not Zakir Khan) as the person in the frame.
+Create a professional LinkedIn-style headshot of the SAME PERSON shown in the subject photos (Images 1–{subject_count}). The composition must satisfy ALL FOUR rules: (1) generous headroom, (2) black bottom gradient that blends into the subject's lower clothing, (3) horizontal centring, AND (4) a soft radial vignette darkening the corners.
 
-IDENTITY (read this first — most common failure mode):
-- The face, skin tone, hair, facial hair, ethnicity, age, gender, and overall identity in the output MUST come from the SUBJECT PHOTOS — the first images in the input. NOT from the composition reference.
-- The composition reference (last image) is a photo of ZAKIR KHAN, an Indian stand-up comedian. Zakir Khan is provided ONLY as a layout/composition example. ZAKIR KHAN IS NOT THE SUBJECT. DO NOT generate Zakir Khan in your output. DO NOT copy his face, beard, hair, ethnicity, expression, blazer, hand pose, microphone, or any visual element of his.
-- The subject of this generation is the person shown in the SUBJECT PHOTOS at the start of the input — a completely different individual from Zakir Khan.
-- If your output ends up looking like Zakir Khan rather than the person in the subject photos, you have made a critical mistake. Start over with the subject photos as the identity source.
-- Sanity check before finishing: cover the body in your output and look at only the face. Does that face match the person in the subject photos? If it instead matches Zakir Khan from the composition reference, regenerate.
+IDENTITY (most common failure mode):
+- The face, skin tone, hair, facial hair, ethnicity, age, gender, and overall identity in the output MUST come from the SUBJECT PHOTOS (Images 1–{subject_count}). NOT from any composition reference.
+- ZAKIR KHAN IS NOT THE SUBJECT. DO NOT generate Zakir Khan in your output.
+- Sanity check: does the output face match the person in Images 1–{subject_count}? If it matches Zakir Khan instead, regenerate.
 
-TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING (most important rule):
-- Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame. The subject's head + shoulders should occupy only the LOWER PORTION of the image, NOT fill the entire frame from top to bottom.
-- Think medium-wide shot, not close-up. The camera is pulled back further than a typical headshot. The hair, face, neck, and shoulders together take roughly the lower 65-75% of the frame — never more.
+TOP PRIORITY — HEADROOM via ZOOMED-OUT FRAMING:
+- Use a WIDER camera framing so the SUBJECT IS SMALLER in the frame.
 - The upper portion of the frame (above Y={GUIDE_TOP_Y}) must be pure background with NO part of the subject in it.
-- Face placement is defined by the designer grid below (hairline Y={GUIDE_TOP_Y}, chin Y={GUIDE_BOTTOM_Y}) — not by eye-line heuristics.
-- IMPORTANT — do NOT try to add headroom by simply translating the subject downward in a tight crop. That just cuts off the shoulders/torso at the bottom. Instead, SHRINK the subject by zooming out — the subject must appear visibly smaller, with both empty background above the head AND the full shoulders/upper torso visible below.
-- FORBIDDEN: hair touching or close to the top edge of the frame; head filling the upper portion of the frame; any cropping of the top of the head or the shoulders.
+- FORBIDDEN: hair touching the top edge; head filling the upper portion; any cropping of the head or shoulders.
 
 Style notes:
-- A polished, photorealistic portrait with a warm, confident expression and a slight smile.
-- The person's clothing should match what they wear in the subject photos (same outfit, same colours).
+- Polished, photorealistic portrait with a warm, confident expression and a slight smile.
+- Same clothing as the subject photos (same outfit, same colours).
 - Soft, diffused studio lighting with natural shadows under the chin and a subtle catch-light in the eyes.
-- Render natural skin texture (subtle pores, fine details) — avoid an airbrushed or plastic look.
-- Hair rendered with natural strands and volume, not a flat mass.
+- Natural skin texture (subtle pores) — no airbrushed or plastic look.
+- Hair with natural strands and volume.
 
-Background — vertical gradient + radial vignette (match the canonical reference for the bottom gradient AND the radial darkening):
-- The TOP portion of the background is a clean, vivid colour that complements the clothing — for example a deep royal blue, teal, or polished grey-blue.
-- The background transitions smoothly DOWNWARD into a rich, deep BLACK band across the bottom of the frame. The lower ~30-40% of the background fades into black, and this black band extends UPWARD into the lower portion of the subject's clothing so the bottom of the jacket dissolves into black with no hard visible edge.
-- ON TOP OF the vertical gradient, apply a SOFT RADIAL VIGNETTE: the area immediately behind and around the subject's head is the brightest part of the background, and the corners and edges of the frame are noticeably darker. The vignette is smooth and subtle — no hard mask, no heavy black border, the subject is never silhouetted.
-- The transitions (both vertical gradient and radial vignette) must be smooth — no banding, no hard lines.
-- Net effect: the corners are dark, the bottom is darker still (fading into the subject's lower clothing), and the area behind the head has a softly-lit "halo" that draws the eye to the face.
+Background — vertical gradient + radial vignette:
+- TOP portion: clean, vivid colour that complements the clothing (deep royal blue, teal, or polished grey-blue).
+- BOTTOM portion: smooth fade DOWNWARD into a rich, deep BLACK band. The lower ~30-40% fades to black; the bottom of the subject's clothing dissolves into black with no hard edge.
+- SOFT RADIAL VIGNETTE on top: area behind the head is brightest; corners and edges noticeably darker in a smooth radial fade. No hard mask, no heavy border.
+- All transitions smooth (no banding, no hard lines).
 
 Composition (landscape 3:2, exactly {PROFILE_WIDTH}×{PROFILE_HEIGHT} pixels):
 
-🟥 MANDATORY FACE POSITION — designer grid (HARD REQUIREMENT — most important rule in this whole prompt) 🟥
-The entire face — from the top of the hair (hairline) down to the bottom of the chin — must fit EXACTLY between two horizontal lines on the canvas:
+🟥 MANDATORY FACE POSITION — designer grid (HARD REQUIREMENT) 🟥
+The entire face — from the top of the hair (hairline) down to the bottom of the chin — must fit EXACTLY between two horizontal lines:
 
     UPPER LINE  →  Y = {GUIDE_TOP_Y}  (top of hair / hairline touches this line)
     LOWER LINE  →  Y = {GUIDE_BOTTOM_Y}  (bottom of chin touches this line)
@@ -1014,52 +992,30 @@ The entire face — from the top of the hair (hairline) down to the bottom of th
 Coordinate system: top-left of the {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas is (0,0). Y increases downward.
 
 Rules — NO exceptions:
-- The top of the hair MUST sit on Y = {GUIDE_TOP_Y}. Not Y=40, not Y=60, not Y=90. EXACTLY Y={GUIDE_TOP_Y} (±2 pixels).
-- The bottom of the chin MUST sit on Y = {GUIDE_BOTTOM_Y}. Not Y=280, not Y=320. EXACTLY Y={GUIDE_BOTTOM_Y} (±2 pixels).
-- The vertical face height (hairline → chin) is therefore EXACTLY {FACE_BAND_HEIGHT} pixels. Nothing else.
-- The horizontal centre of the face (centre of the nose, midpoint between the eyes) MUST sit on X = {GUIDE_CENTER_X} (the vertical middle of the canvas).
-- Background ONLY between Y=0 and Y={GUIDE_TOP_Y} (above the hairline). No part of the head, hair, or face enters that band.
-- Shoulders, neck, upper torso live BELOW Y={GUIDE_BOTTOM_Y}.
-- If the face would be larger than {FACE_BAND_HEIGHT} px, ZOOM OUT (move the camera back) until the hairline → chin span is exactly {FACE_BAND_HEIGHT} px.
-- If the face would be smaller than {FACE_BAND_HEIGHT} px, ZOOM IN until the span is exactly {FACE_BAND_HEIGHT} px.
-- Do NOT use eye-line / rule-of-thirds heuristics. Use these Y coordinates directly.
-
-Mental check: imagine drawing a horizontal cyan line at Y={GUIDE_TOP_Y} and a horizontal cyan line at Y={GUIDE_BOTTOM_Y}. The whole face must fit snugly between those two lines — top of hair touches the upper line, chin touches the lower line.
-
-Additional framing:
-- The full subject from top-of-hair to upper-torso fits inside the frame without cropping the top of the head or shoulders.
-- Equal background on left and right of the centred face.
-- A slightly angled pose works well; avoid a straight-on stare.
+- Hairline at Y = {GUIDE_TOP_Y} (±2 px). Chin at Y = {GUIDE_BOTTOM_Y} (±2 px).
+- Face height = exactly {FACE_BAND_HEIGHT} pixels (hairline → chin).
+- Face horizontal centre at X = {GUIDE_CENTER_X}.
+- Background only above the hairline (Y=0 to Y={GUIDE_TOP_Y}). No face/hair in that band.
+- Shoulders/torso below Y={GUIDE_BOTTOM_Y}.
+- ZOOM OUT if face too large, ZOOM IN if too small, until the span is exactly {FACE_BAND_HEIGHT} px.
 
 Self-check before finishing:
-1. Is the person the SUBJECT from the upload photos (not Zakir Khan)?
-2. Hairline at Y≈{GUIDE_TOP_Y}, chin at Y≈{GUIDE_BOTTOM_Y}, face centred at X≈{GUIDE_CENTER_X} on a {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas?
-3. Clear background band above the hair (above Y={GUIDE_TOP_Y})?
+1. Is the person from the SUBJECT PHOTOS (not Zakir Khan)?
+2. Hairline at Y≈{GUIDE_TOP_Y}, chin at Y≈{GUIDE_BOTTOM_Y}, face centred at X≈{GUIDE_CENTER_X}?
+3. Clear background band above the hair?
 
 Output one bright, polished landscape headshot at 3:2 ({PROFILE_WIDTH}×{PROFILE_HEIGHT})."""
 
     if custom_prompt:
-        prompt_text += f"""
-
-User preferences to incorporate where they fit naturally:
-{custom_prompt}"""
+        prompt_text += f"\n\nUser preferences to incorporate where they fit naturally:\n{custom_prompt}"
 
     if improvement_feedback:
-        prompt_text += f"""
+        prompt_text += f"\n\nNotes from a previous attempt — please address these:\n{improvement_feedback}"
 
-Notes from a previous attempt — please address these in this version:
-{improvement_feedback}"""
-
-    contents.append(prompt_text)
-
-    return call_gemini_with_retry(
-        client,
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio="3:2"),
-        ),
+    return call_openai_image_with_retry(
+        input_images,
+        prompt_text,
+        size="1536x1024",
         context="profile image",
     )
 
@@ -1076,53 +1032,47 @@ def _profile_png_bytes(image_bytes: bytes) -> bytes:
 
 def uniform_profile_background_gemini(aligned_image_bytes: bytes) -> bytes:
     """
-    Gemini edit pass: ONLY remove flat border padding and extend the existing background
-    so the canvas is seamless edge-to-edge. The PERSON must not be changed in any way.
-
-    NOTE: No reference images are passed in — using only a text description of the target
-    background avoids identity bleed (e.g. Zakir Khan) from a composition reference image.
+    gpt-image-2 edit pass: ONLY remove flat border padding and extend the existing
+    background so the canvas is seamless edge-to-edge. The PERSON must not be changed.
+    No extra reference images — text-only prompt to avoid identity bleed.
     """
-    client = get_gemini_client()
     src = Image.open(io.BytesIO(aligned_image_bytes)).convert("RGB")
     if src.size != (PROFILE_WIDTH, PROFILE_HEIGHT):
         src = src.resize((PROFILE_WIDTH, PROFILE_HEIGHT), Image.Resampling.LANCZOS)
+    src_bytes = _pil_to_png_bytes(src)
 
     prompt = f"""You are doing a BACKGROUND-ONLY retouch on the input image (a {PROFILE_WIDTH}×{PROFILE_HEIGHT} profile banner).
 
 THE PROBLEM TO FIX:
-The input has flat-colour borders or a visible inner rectangle (picture-in-picture / letterbox bars / mismatched padding around the subject).
+The input may have flat-colour borders or a visible inner rectangle (letterbox bars / mismatched padding around the subject).
 Eliminate ALL of these:
 - Dark grey, black, or solid-colour vertical bars on the left and right edges.
 - A visible inner rectangular frame — the portrait should not look pasted inside a larger box.
 - Flat padding bands that don't match the inner gradient.
 - Any "two backgrounds" or seam between the portrait area and the border area.
 
-YOUR ONLY TASK — extend / repaint the BACKGROUND so it fills the whole canvas with the same style of background that already exists around the subject's head and shoulders inside the photo. Keep the same colour palette, lighting direction, and vignette that the input already has — just extend it to all four edges so there are no borders.
+YOUR ONLY TASK — extend / repaint the BACKGROUND so it fills the whole canvas with the same style of background that already exists around the subject's head and shoulders inside the photo. Keep the same colour palette, lighting direction, and vignette the input already has — just extend it to all four edges so there are no borders.
 
-REQUIRED BACKGROUND CHARACTERISTICS (these match the rest of the engage4more banner family — apply only to the background, not to the person):
-- TOP portion of the background: a clean, vivid colour that complements the subject's clothing (e.g. deep royal blue / teal / polished grey-blue / similar to what the input already uses).
-- BOTTOM portion of the background: smooth fade DOWNWARD into a rich, deep BLACK band. The lower part of the subject's clothing dissolves into that black with no hard edge.
-- A SOFT RADIAL VIGNETTE on top of the vertical gradient: the area immediately behind the head is the brightest part of the background; the corners and edges of the frame are noticeably darker, in a smooth radial fade. No hard mask, no heavy black border, the subject is never silhouetted.
+REQUIRED BACKGROUND CHARACTERISTICS (apply only to the background, not to the person):
+- TOP portion: clean, vivid colour that complements the subject's clothing (deep royal blue / teal / polished grey-blue / similar to what the input already uses).
+- BOTTOM portion: smooth fade DOWNWARD into a rich, deep BLACK band. The lower part of the subject's clothing dissolves into that black with no hard edge.
+- SOFT RADIAL VIGNETTE on top of the vertical gradient: area behind the head is brightest; corners and edges noticeably darker in a smooth radial fade. No hard mask, no heavy border.
 - All transitions smooth (no banding, no hard lines).
 - Background touches LEFT, RIGHT, TOP, and BOTTOM edges of the {PROFILE_WIDTH}×{PROFILE_HEIGHT} canvas — full bleed.
 
 🟥 ABSOLUTELY DO NOT 🟥 (any of these = failure):
-- Do NOT change the person at all. Same face, same skin tone, same hair, same beard/moustache/stubble, same ethnicity, same age, same gender, same expression, same pose, same clothing colour, same clothing style — identical to the input.
-- Do NOT swap or regenerate the face. Do NOT borrow features from anyone else (no celebrity, no Zakir Khan, no Aman Gupta, no person from your training data).
-- Do NOT move the face up, down, left, or right. The hairline must stay at Y≈{GUIDE_TOP_Y}, the chin at Y≈{GUIDE_BOTTOM_Y}, the face center at X≈{GUIDE_CENTER_X}.
-- Do NOT zoom in or zoom out on the subject. Do NOT recrop. Do NOT change the size of the head/face.
+- Do NOT change the person at all. Same face, skin tone, hair, beard/moustache, ethnicity, age, gender, expression, pose, clothing colour and style — identical to the input.
+- Do NOT swap or regenerate the face. Do NOT borrow features from anyone else.
+- Do NOT move the face. Hairline must stay at Y≈{GUIDE_TOP_Y}, chin at Y≈{GUIDE_BOTTOM_Y}, face centre at X≈{GUIDE_CENTER_X}.
+- Do NOT zoom in or out. Do NOT recrop. Do NOT resize the head.
 - Do NOT add text, logos, watermarks, microphones, hands, props, or extra objects.
 
 Output: exactly one {PROFILE_WIDTH}×{PROFILE_HEIGHT} landscape image — same person in the same position, with one continuous background that has no borders."""
 
-    out_bytes = call_gemini_with_retry(
-        client,
-        model=GEMINI_MODEL,
-        contents=[src, prompt],
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio="3:2"),
-        ),
+    out_bytes = call_openai_image_with_retry(
+        [src_bytes],
+        prompt,
+        size="1536x1024",
         context="profile background uniform",
     )
     return _profile_png_bytes(out_bytes)
@@ -1136,61 +1086,56 @@ def generate_gallery_image(
     custom_prompt: str | None = None,
 ) -> bytes:
     """
-    Generate one natural event/action gallery image for the artist.
+    Generate one natural event/action gallery image for the artist using gpt-image-2.
 
     Args:
         images: User-uploaded subject reference photos.
         scene_prompt: The event scene description for this gallery variant.
-        profile_anchor_image: The approved profile headshot (raw PNG bytes from Gemini).
+        profile_anchor_image: The approved profile headshot (PNG bytes).
             Used as the CANONICAL face reference for maximum identity consistency.
         improvement_feedback: Feedback from a prior failed face-match guardrail attempt.
         custom_prompt: User-supplied extra tags / preferences.
     """
-    client = get_gemini_client()
-
-    contents: list = []
+    input_images: list[bytes] = []
+    image_labels: list[str] = []
 
     # 1. Style reference (lighting / polish only)
-    style_ref = Image.open(STYLE_REFERENCE_PATH).convert("RGB")
-    contents.append(style_ref)
-    contents.append(
-        "Above is a STYLE REFERENCE image. Use it only for realism, clean lighting, "
-        "polish, and overall photographic quality. DO NOT copy this person's face — "
-        "this is not the subject."
-    )
+    try:
+        style_bytes = _pil_to_png_bytes(Image.open(STYLE_REFERENCE_PATH).convert("RGB"))
+        input_images.append(style_bytes)
+        image_labels.append("STYLE REFERENCE — use only for realism, clean lighting, and polish. DO NOT copy this person's face.")
+    except FileNotFoundError:
+        pass
 
-    # 2. CANONICAL FACE ANCHOR — the approved profile headshot (if available)
+    # 2. CANONICAL FACE ANCHOR — profile headshot (if available)
     if profile_anchor_image:
-        anchor_img = Image.open(io.BytesIO(profile_anchor_image)).convert("RGB")
-        contents.append(anchor_img)
-        contents.append(
-            "Above is the CANONICAL FACE REFERENCE. This is the exact face you MUST "
-            "reproduce in the output — same facial structure, same skin tone, same "
-            "facial hair, same hair, same eyes, same nose, same lips. This image is "
-            "the single source of truth for this person's identity. Treat every facial "
-            "pixel in this reference as sacred — do not invent, interpolate, or stylise. "
-            "If there is ANY conflict between this reference and the subject photos below, "
-            "THIS reference wins."
+        anchor_bytes = _pil_to_png_bytes(Image.open(io.BytesIO(profile_anchor_image)).convert("RGB"))
+        input_images.append(anchor_bytes)
+        image_labels.append(
+            "CANONICAL FACE REFERENCE — This is the exact face you MUST reproduce in the output. "
+            "Same facial structure, skin tone, facial hair, hair, eyes, nose, lips. "
+            "Single source of truth for this person's identity. Wins over all other references."
         )
 
-    # 3. Additional subject reference photos (for clothing + secondary identity cues)
+    # 3. Subject reference photos (clothing + secondary identity cues)
     for img_bytes, _ in images:
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        contents.append(pil_img)
-    contents.append(
-        "Above are additional SUBJECT reference photos. Use them to confirm clothing "
-        "colours/style and secondary identity cues. For the face, defer to the canonical "
-        "face reference."
-    )
+        subj_bytes = _pil_to_png_bytes(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+        input_images.append(subj_bytes)
+        image_labels.append("SUBJECT REFERENCE — use for clothing colours/style and secondary identity cues. For the face, defer to the canonical face reference above.")
 
-    prompt_text = f"""Generate one natural, professional event-style gallery image of this person.
+    image_index_notes = "\n".join(f"  Image {i+1}: {lbl}" for i, lbl in enumerate(image_labels))
+
+    prompt_text = f"""IMAGE REFERENCES IN THIS REQUEST:
+{image_index_notes}
+
+Generate one natural, professional event-style gallery image of this person.
 
 SCENE REQUIREMENT:
 {scene_prompt}
 
 CRITICAL REQUIREMENTS:
 
-1. **FACIAL IDENTITY — HIGHEST PRIORITY (non-negotiable)**: The face in the output MUST be a pixel-faithful reproduction of the canonical face reference. This is the single most important requirement — an image with a non-matching face is an automatic failure. The generated person must be instantly recognisable as the same individual to anyone who sees both images side-by-side.
+1. **FACIAL IDENTITY — HIGHEST PRIORITY (non-negotiable)**: The face in the output MUST be a pixel-faithful reproduction of the canonical face reference. An image with a non-matching face is an automatic failure. The generated person must be instantly recognisable as the same individual to anyone who sees both images side-by-side.
 
    Match ALL of these EXACTLY:
    - Eye shape, eye spacing, eye colour, eyelid crease, and distance between the eyes.
@@ -1204,55 +1149,40 @@ CRITICAL REQUIREMENTS:
    - Any moles, freckles, scars, dimples, or distinguishing marks.
    - Head shape and proportions (forehead size, face length-to-width ratio).
 
-   DO NOT invent or stylise the face. DO NOT merge with generic "speaker" stereotypes. The output face is a TRANSPLANT of the canonical reference into the scene — nothing more.
+   DO NOT invent or stylise the face. DO NOT merge with generic "speaker" stereotypes.
 
-2. **Hyper-realistic face rendering**: Visible skin pores, subsurface scattering, individual eyebrow hairs and eyelashes, realistic iris detail with a specular highlight. Absolutely NO plastic, airbrushed, painted, or CGI look.
+2. **Hyper-realistic face rendering**: Visible skin pores, subsurface scattering, individual eyebrow hairs and eyelashes, realistic iris detail with a specular highlight. NO plastic, airbrushed, painted, or CGI look.
 
-3. **Clothing**: Preserve clothing style and colours consistent with the subject reference photos (do not drastically change the outfit unless the scene demands it).
+3. **Clothing**: Preserve clothing style and colours consistent with the subject reference photos.
 
-4. **Scene feel**: Image should feel candid/action-oriented, not a studio headshot. Natural event atmosphere with realistic lighting, no AI artifacts.
+4. **Scene feel**: Candid/action-oriented, not a studio headshot. Natural event atmosphere with realistic lighting, no AI artifacts.
 
 5. **Composition**: Horizontal banner suitable for a website gallery.
 
-6. **Face visibility**: Keep the face clearly visible and sharp — the face is the focal point even in action/wide shots. No heavy occlusions, no motion blur on the face, no awkward cropping.
+6. **Face visibility**: Keep the face clearly visible and sharp — it is the focal point even in action/wide shots. No heavy occlusions, no motion blur on the face, no awkward cropping.
 
 7. **Face sizing (strict)**:
    - The face (hairline to chin) MUST occupy at least 20-30% of the frame's vertical height.
-   - Face pixels in the output must be large enough that every facial feature listed above is clearly recognisable.
-   - If the scene would push the face too small (e.g. very wide establishing shot), pull the camera closer to the subject so the face stays detailed.
+   - Face pixels must be large enough that every facial feature is clearly recognisable.
+   - If the scene would push the face too small, pull the camera closer.
 
 8. **Face-centering constraints**:
    - Keep the face near the centre area of the frame even in action shots.
-   - Ensure full head visibility with clean headroom (no top/head crop).
+   - Full head visibility with clean headroom (no top/head crop).
    - Avoid aggressive edge-cropping of face or shoulders.
 
 Output a single high-quality horizontal image. REMEMBER: face identity is non-negotiable. If the face does not match the canonical reference exactly, the image is a failure."""
 
     if custom_prompt:
-        prompt_text += f"""
-
-USER TAGS / PREFERENCES:
-{custom_prompt}
-Apply these preferences when they do not conflict with core quality, realism, or facial identity."""
+        prompt_text += f"\n\nUSER TAGS / PREFERENCES:\n{custom_prompt}\nApply when they do not conflict with core quality, realism, or facial identity."
 
     if improvement_feedback:
-        prompt_text += f"""
+        prompt_text += f"\n\nIMPORTANT — The previous gallery attempt was rejected because the face did not match the canonical reference. Feedback:\n{improvement_feedback}\n\nRegenerate with a face that EXACTLY matches the canonical face reference. All other requirements remain in force."
 
-IMPORTANT — The previous gallery attempt was rejected because the face did not match the canonical reference. Feedback:
-{improvement_feedback}
-
-Regenerate this gallery image with a face that EXACTLY matches the canonical face reference. All other requirements remain in force."""
-
-    contents.append(prompt_text)
-
-    return call_gemini_with_retry(
-        client,
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio="21:9"),
-        ),
+    return call_openai_image_with_retry(
+        input_images,
+        prompt_text,
+        size="1536x1024",
         context="gallery image",
     )
 
@@ -1593,18 +1523,11 @@ def refine_gallery_image_with_feedback(
     instruction: str,
 ) -> bytes:
     """
-    Ask Gemini (Nano Banana) to edit a single gallery image guided by the
-    OpenAI-generated instruction. Returns refined image bytes at the same
-    aspect/size as the input (caller is responsible for re-cropping/encoding).
-
-    NOTE: Gemini's image-edit path on real-person photos often refuses with
-    IMAGE_OTHER. The retry helper handles transient failures; permanent
-    refusals will raise RuntimeError, which the caller should catch and treat
-    as "keep original image".
+    Ask gpt-image-2 to edit a single gallery image guided by the instruction.
+    Returns refined image bytes. Caller should catch RuntimeError and keep
+    the original image if the edit fails.
     """
-    client = get_gemini_client()
-
-    src_img = Image.open(io.BytesIO(gallery_image)).convert("RGB")
+    src_bytes = _pil_to_png_bytes(Image.open(io.BytesIO(gallery_image)).convert("RGB"))
 
     prompt = (
         "Refine this image with a minimal, targeted edit.\n\n"
@@ -1615,16 +1538,12 @@ def refine_gallery_image_with_feedback(
         "same aspect ratio as the input."
     )
 
-    edited_bytes = call_gemini_with_retry(
-        client,
-        model=NANO_BANANA_REGEN_MODEL,
-        contents=[src_img, prompt],
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE", "TEXT"],
-        ),
+    return call_openai_image_with_retry(
+        [src_bytes],
+        prompt,
+        size="1536x1024",
         context="gallery refinement",
     )
-    return edited_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -2049,7 +1968,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**Models used**")
     st.markdown("- Profile output review / ranking: `gpt-4o`")
-    st.markdown(f"- Profile + gallery regeneration: `{GEMINI_MODEL}`")
+    st.markdown(f"- Profile + gallery image generation: `{GPT_IMAGE_MODEL}`")
 
 # ---- File uploader ----
 uploaded_files = st.file_uploader(
